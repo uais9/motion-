@@ -63,3 +63,22 @@ fun Project.withLayer(compId: Long, footageId: Long): Project {
         nextId = nextId + 1
     )
 }
+
+// Sets fixed values on a layer's properties (typed in the Edit layer dialog).
+// Keyframe editing comes in a later phase.
+fun Project.withLayerValues(
+    compId: Long,
+    layerId: Long,
+    values: Map<String, List<Double>>
+): Project {
+    val comp = comps.firstOrNull { it.id == compId } ?: return this
+    val layer = comp.layers.firstOrNull { it.id == layerId } ?: return this
+    var props = layer.props
+    for ((path, v) in values) {
+        val old = props[path]
+        props = props + (path to Prop(v, old?.keys ?: emptyList()))
+    }
+    val newLayer = layer.copy(props = props)
+    val newComp = comp.copy(layers = comp.layers.map { if (it.id == layerId) newLayer else it })
+    return copy(comps = comps.map { if (it.id == compId) newComp else it })
+}
