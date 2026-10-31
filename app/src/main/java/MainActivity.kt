@@ -32,6 +32,7 @@ class MainActivity : Activity() {
     private lateinit var compView: CompView
     private lateinit var layerTimeline: LayerTimelineView
     private lateinit var timeLabel: TextView
+    private lateinit var panel: PropertyPanelView
 
     private var currentTime = 0L
     private var selectedLayerId = -1L
@@ -89,12 +90,22 @@ class MainActivity : Activity() {
             onTrim = { id, edge, target -> trimLayer(id, edge, target) }
         }
 
+        panel = PropertyPanelView(this).apply {
+            onScrubStart = { session.beginGroup() }
+            onScrub = { path, v -> scrubValue(path, v) }
+            onScrubEnd = { endScrub() }
+            onTapValue = { path -> showValueDialog(path) }
+            onReset = { path -> resetValue(path) }
+            onToggle = { path -> toggleAnim(path) }
+            onKey = { path -> keyAction(path) }
+        }
+
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("New comp") { showNewComp() })
             addView(btn("Import") { pickMedia() })
             addView(btn("Add layer") { showAddLayer() })
-            addView(btn("Layer") { showLayerSettings() })
+            addView(btn("Info") { showInfo() })
         }
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -130,10 +141,10 @@ class MainActivity : Activity() {
             addView(compView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.4f))
             addView(timeLabel)
             addView(layerTimeline, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(172)))
+            addView(panel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(184)))
             addView(row1)
             addView(row2)
             addView(row3)
-            addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.7f))
         }
         setContentView(root)
         refresh()
@@ -145,6 +156,7 @@ class MainActivity : Activity() {
         val c = session.currentComp()
         compView.setData(session.project, c, currentTime, selectedLayerId)
         layerTimeline.setData(session.project, c, currentTime, selectedLayerId)
+        updatePanel()
     }
 
     private fun updateTimeUi() {
@@ -486,67 +498,65 @@ class MainActivity : Activity() {
         return row
     }
 
-    private fun showLayerSettings() {
-        val comp = session.currentComp()
-        if (comp == null || comp.layers.isEmpty()) {
-            toast("Add a layer first")
-            return
-        }
-        val names = comp.layers.mapIndexed { i, l -> "${i + 1}. ${l.name}" }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Which layer?")
-            .setItems(names) { _, which ->
-                val layer = comp.layers[which]
-                selectedLayerId = layer.id
-                refresh()
-                showLayerForm(comp, layer)
-            }
-            .show()
+    // ---------- property panel and keyframes ----------
+
+    private fun selectedPair(): Pair<Comp, Layer>? {
+        val c = session.currentComp() ?: return null
+        val l = c.layers.firstOrNull { it.id == selectedLayerId } ?: return null
+        return Pair(c, l)
     }
 
-    private fun showLayerForm(comp: Comp, layer: Layer) {
-        val lt = currentTime - layer.startTime
-        fun cur(path: String, i: Int, def: Double): Double =
-            Eval.layerValue(layer, path, lt).getOrNull(i) ?: def
+    // Keyframe times are measured from the layer's start (layer time), on whole frames.
+    private fun layerTimeNow(c: Comp, l: Layer): Long =
+        snapFrame(currentTime, c.frameRate) - l.startTime
 
-        val posX = numEdit(cur(Path.POSITION, 0, 0.0))
-        val posY = numEdit(cur(Path.POSITION, 1, 0.0))
-        val sclX = numEdit(cur(Path.SCALE, 0, 100.0))
-        val sclY = numEdit(cur(Path.SCALE, 1, 100.0))
-        val rot = numEdit(cur(Path.ROTATION, 0, 0.0))
-        val opa = numEdit(cur(Path.OPACITY, 0, 100.0))
-        val ancX = numEdit(cur(Path.ANCHOR, 0, 0.0))
-        val ancY = numEdit(cur(Path.ANCHOR, 1, 0.0))
+    private fun updatePanel() {
+        val sel = selectedPair()
+        if (sel == null) {
+            panel.setData(null, 0L, emptyMap())
+        } else {
+            panel.setData(sel.second, layerTimeNow(sel.first, sel.second), emptyMap())
+        }
+    }
 
+    private fun scrubValue(path: String, v: List<Double>) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        val lt = layerTimeNow(c, l)
+        session.modify { p -> p.withLayerProp(c.id, l.id, path) { pr -> setPropAt(pr, lt, v) } }
+        pushToView()
+    }
+
+    private fun endScrub() {
+        session.save()
+        refresh()
+    }
+
+    private fun showValueDialog(path: String) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        val lt = layerTimeNow(c, l)
+        val cur = Eval.layerValue(l, path, lt)
+        if (cur.isEmpty()) return
+        val edits = cur.map { numEdit(it) }
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(8), dp(20), dp(8))
-            addView(formRow("Position X, Y (pixels)", posX, posY))
-            addView(formRow("Scale X, Y (percent)", sclX, sclY))
-            addView(formRow("Rotation (degrees, clockwise)", rot))
-            addView(formRow("Opacity (percent)", opa))
-            addView(formRow("Anchor point X, Y (pixels in the picture)", ancX, ancY))
+            addView(formRow(PropertyPanelView.labelOf(path), *edits.toTypedArray()))
         }
-        val scroll = ScrollView(this).apply { addView(form) }
-
         AlertDialog.Builder(this)
-            .setTitle(layer.name)
-            .setView(scroll)
+            .setTitle(l.name)
+            .setView(form)
             .setPositiveButton("Apply") { _, _ ->
-                val parsed = listOf(posX, posY, sclX, sclY, rot, opa, ancX, ancY)
-                    .map { it.text.toString().toDoubleOrNull() }
-                if (parsed.any { it == null }) {
+                val nums = edits.map { it.text.toString().toDoubleOrNull() }
+                if (nums.any { it == null }) {
                     toast("Check the numbers")
                 } else {
-                    val n = parsed.map { it ?: 0.0 }
-                    val values = mapOf(
-                        Path.POSITION to listOf(n[0], n[1]),
-                        Path.SCALE to listOf(n[2], n[3]),
-                        Path.ROTATION to listOf(n[4]),
-                        Path.OPACITY to listOf(n[5].coerceIn(0.0, 100.0)),
-                        Path.ANCHOR to listOf(n[6], n[7])
-                    )
-                    session.edit { p -> p.withLayerValues(comp.id, layer.id, values) }
+                    val vals = nums.map { it ?: 0.0 }
+                    val fixed = if (path == Path.OPACITY) vals.map { it.coerceIn(0.0, 100.0) } else vals
+                    session.edit { p -> p.withLayerProp(c.id, l.id, path) { pr -> setPropAt(pr, lt, fixed) } }
                     refresh()
                 }
             }
@@ -554,8 +564,58 @@ class MainActivity : Activity() {
             .show()
     }
 
+    private fun resetValue(path: String) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        val f = session.project.footage.firstOrNull { it.id == l.footageId } ?: return
+        val d = defaultTransform(f, c)[path]?.value ?: return
+        val lt = layerTimeNow(c, l)
+        session.edit { p -> p.withLayerProp(c.id, l.id, path) { pr -> setPropAt(pr, lt, d) } }
+        refresh()
+    }
+
+    private fun toggleAnim(path: String) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        val pr = l.props[path] ?: return
+        val lt = layerTimeNow(c, l)
+        val cur = Eval.valueAt(pr, lt)
+        session.edit { p -> p.withLayerProp(c.id, l.id, path) { x -> toggleAnimated(x, lt, cur) } }
+        refresh()
+    }
+
+    private fun keyAction(path: String) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        val pr = l.props[path] ?: return
+        if (!pr.animated) {
+            toast("Tap the stopwatch first")
+            return
+        }
+        val lt = layerTimeNow(c, l)
+        val has = pr.keys.any { it.time == lt }
+        val cur = Eval.valueAt(pr, lt)
+        session.edit { p ->
+            p.withLayerProp(c.id, l.id, path) { x ->
+                if (has) deleteKeyAt(x, lt) else setPropAt(x, lt, cur)
+            }
+        }
+        refresh()
+    }
+
+    private fun showInfo() {
+        AlertDialog.Builder(this)
+            .setTitle("Project info")
+            .setMessage(report.text.toString())
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
     private fun showSelfTest() {
-        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run()
+        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run() + KeyframeTest.run()
         AlertDialog.Builder(this)
             .setTitle("Self-test")
             .setMessage(lines.joinToString("\n"))

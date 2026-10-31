@@ -274,3 +274,98 @@ object OpsTest {
         return out
     }
 }
+
+// ---------- keyframes ----------
+
+// Changes one property of one layer.
+fun Project.withLayerProp(
+    compId: Long,
+    layerId: Long,
+    path: String,
+    change: (Prop) -> Prop
+): Project = mapComp(compId) { c ->
+    c.copy(layers = c.layers.map { l ->
+        if (l.id != layerId) {
+            l
+        } else {
+            val old = l.props[path]
+            if (old == null) l else l.copy(props = l.props + (path to change(old)))
+        }
+    })
+}
+
+// Sets a property's value at layer time lt.
+// Fixed property: just changes the value. Animated property: adds or replaces a keyframe at lt.
+fun setPropAt(prop: Prop, lt: Long, value: List<Double>): Prop {
+    if (!prop.animated) return prop.copy(value = value)
+    val old = prop.keys.firstOrNull { it.time == lt }
+    val key = if (old != null) old.copy(value = value) else Keyframe(lt, value)
+    val keys = (prop.keys.filter { it.time != lt } + key).sortedBy { it.time }
+    return prop.copy(keys = keys)
+}
+
+// Stopwatch: turns animation on (one keyframe at lt) or off (keeps the current value).
+fun toggleAnimated(prop: Prop, lt: Long, current: List<Double>): Prop =
+    if (prop.animated) Prop(current) else Prop(prop.value, listOf(Keyframe(lt, current)))
+
+// Deletes the keyframe at lt. Deleting the last one makes the property fixed again.
+fun deleteKeyAt(prop: Prop, lt: Long): Prop {
+    val gone = prop.keys.firstOrNull { it.time == lt } ?: return prop
+    val keys = prop.keys.filter { it.time != lt }
+    return if (keys.isEmpty()) Prop(gone.value) else prop.copy(keys = keys)
+}
+
+object KeyframeTest {
+    fun run(): List<String> {
+        val out = ArrayList<String>()
+
+        fun check(name: String, ok: Boolean) {
+            out.add((if (ok) "PASS  " else "FAIL  ") + name)
+        }
+
+        fun near(a: Double, b: Double): Boolean = Math.abs(a - b) < 1e-6
+
+        val sec = TICKS_PER_SECOND
+        val fixed = Prop(listOf(10.0))
+        check(
+            "setting a fixed property just changes its value",
+            setPropAt(fixed, sec, listOf(5.0)) == Prop(listOf(5.0))
+        )
+        val a = toggleAnimated(fixed, 0L, listOf(10.0))
+        check(
+            "stopwatch on makes one keyframe at the playhead",
+            a.animated && a.keys.size == 1 && a.keys[0].time == 0L && a.keys[0].value == listOf(10.0)
+        )
+        val b = setPropAt(a, sec, listOf(110.0))
+        check("changing an animated value later adds a keyframe", b.keys.size == 2 && b.keys[1].time == sec)
+        check("value halfway between two keyframes", near(Eval.valueAt(b, sec / 2)[0], 60.0))
+        val c = setPropAt(b, sec, listOf(210.0))
+        check("changing at an existing keyframe replaces it", c.keys.size == 2 && c.keys[1].value == listOf(210.0))
+        val d = setPropAt(c, sec / 2, listOf(0.0))
+        check("keyframes stay sorted by time", d.keys.map { it.time } == listOf(0L, sec / 2, sec))
+        val e1 = deleteKeyAt(c, sec)
+        check("deleting a keyframe removes only that one", e1.keys.size == 1 && e1.animated)
+        val e2 = deleteKeyAt(e1, 0L)
+        check("deleting the last keyframe makes the value fixed", !e2.animated && e2.value == listOf(10.0))
+        val f = toggleAnimated(b, 0L, Eval.valueAt(b, sec / 2))
+        check("stopwatch off keeps the current value", !f.animated && near(f.value[0], 60.0))
+
+        val r = Project().withNewComp("T", 1080, 1920, FrameRate.FPS_30, secondsToTicks(10.0), 0xFF000000.toInt())
+        var p = r.first
+        val compId = r.second
+        p = p.withFootage(
+            listOf(Footage(0L, "v.mp4", "content://v", FootageKind.VIDEO, 576, 1024, secondsToTicks(20.0)))
+        )
+        p = p.withLayer(compId, p.footage[0].id)
+        val layer = p.comps[0].layers[0]
+        val after = p.withLayerProp(compId, layer.id, Path.OPACITY) { setPropAt(it, 0L, listOf(30.0)) }
+        val l2 = after.comps[0].layers[0]
+        check(
+            "changing one property leaves the others alone",
+            l2.props[Path.OPACITY]?.value == listOf(30.0) &&
+                l2.props[Path.POSITION] == layer.props[Path.POSITION]
+        )
+
+        return out
+    }
+}

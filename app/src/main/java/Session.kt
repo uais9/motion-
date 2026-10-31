@@ -52,6 +52,18 @@ class Session(private val file: File) {
         save()
     }
 
+    // Starts ONE undo step for a drag. Then call modify() as often as needed, and save() at the end.
+    fun beginGroup() {
+        undoStack.add(project)
+        if (undoStack.size > 100) undoStack.removeAt(0)
+        redoStack.clear()
+    }
+
+    fun modify(change: (Project) -> Project) {
+        project = change(project)
+        fixCurrent()
+    }
+
     fun undo(): Boolean {
         if (undoStack.isEmpty()) return false
         redoStack.add(project)

@@ -74,6 +74,12 @@ class LayerTimelineView(context: Context) : View(context) {
         color = Color.WHITE
         isAntiAlias = true
     }
+    private val diamond = android.graphics.Path()
+    private val diamondPaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+    }
+
     private val tickPaint = Paint().apply {
         color = Color.GRAY
         strokeWidth = density
@@ -253,6 +259,16 @@ class LayerTimelineView(context: Context) : View(context) {
                 canvas.restore()
             }
 
+            // keyframe diamonds (keyframe times are measured from the layer's start time)
+            val shift = if (l.id == movingId) movingDelta else 0L
+            for (prop in l.props.values) {
+                for (key in prop.keys) {
+                    val kt = l.startTime + key.time + shift
+                    if (kt < inP || kt > outP) continue
+                    drawDiamond(canvas, xOf(kt), rect.bottom - 7f * density, 4.5f * density)
+                }
+            }
+
             if (l.id == movingId) {
                 borderPaint.color = Color.YELLOW
                 canvas.drawRoundRect(rect, 5f * density, 5f * density, borderPaint)
@@ -291,6 +307,16 @@ class LayerTimelineView(context: Context) : View(context) {
 
         canvas.drawLine(cx, 0f, cx, h, headPaint)
         canvas.drawCircle(cx, 4f * density, 4f * density, headPaint)
+    }
+
+    private fun drawDiamond(canvas: Canvas, x: Float, y: Float, r: Float) {
+        diamond.reset()
+        diamond.moveTo(x, y - r)
+        diamond.lineTo(x + r, y)
+        diamond.lineTo(x, y + r)
+        diamond.lineTo(x - r, y)
+        diamond.close()
+        canvas.drawPath(diamond, diamondPaint)
     }
 
     // ---------- touch ----------
