@@ -1,0 +1,415 @@
+package com.motion
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.View
+import android.view.ViewConfiguration
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
+
+// The timeline: one row per layer, top layer first.
+//  - drag empty space sideways: move the playhead
+//  - drag up or down: scroll the rows
+//  - tap a bar: select it
+//  - drag a selected bar's edges: trim it
+//  - long-press a bar, then drag: move it in time, or to another row (stacking order)
+//  - pinch: zoom
+// Every edit snaps to whole frames.
+class LayerTimelineView(context: Context) : View(context) {
+    private var project: Project = Project()
+    private var comp: Comp? = null
+    private var playhead = 0L
+    private var selectedId = -1L
+
+    var onScrub: ((Long) -> Unit)? = null
+    var onSelect: ((Long) -> Unit)? = null
+    var onMove: ((Long, Long, Int) -> Unit)? = null
+    var onTrim: ((Long, Int, Long) -> Unit)? = null
+
+    private val density = resources.displayMetrics.density
+    private val rulerH = 22f * density
+    private val rowH = 34f * density
+    private val rowGap = 3f * density
+    private val topPad = rulerH + 4f * density
+
+    private var pxPerSec = 70f * density
+    private var scrollY = 0f
+
+    private var downX = 0f
+    private var downY = 0f
+    private var lastY = 0f
+    private var downPlayhead = 0L
+    private var moved = false
+    private var mode = 0
+    private var movingId = -1L
+    private var movingDelta = 0L
+    private var movingRow = 0
+    private var trimId = -1L
+    private var trimEdge = 0
+    private var trimTarget = 0L
+
+    private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    private val rect = RectF()
+    private val handleRect = RectF()
+
+    private val rowPaint = Paint().apply { color = Color.parseColor("#1E1E27") }
+    private val outsidePaint = Paint().apply { color = Color.parseColor("#AA0B0B0E") }
+    private val rulerBgPaint = Paint().apply { color = Color.parseColor("#15151A") }
+    private val barPaint = Paint().apply { isAntiAlias = true }
+    private val borderPaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+        isAntiAlias = true
+    }
+    private val handlePaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+    }
+    private val tickPaint = Paint().apply {
+        color = Color.GRAY
+        strokeWidth = density
+    }
+    private val labelPaint = Paint().apply {
+        color = Color.LTGRAY
+        textSize = 10f * density
+        isAntiAlias = true
+    }
+    private val textPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 11f * density
+        isAntiAlias = true
+    }
+    private val headPaint = Paint().apply {
+        color = Color.WHITE
+        strokeWidth = 2f * density
+        isAntiAlias = true
+    }
+
+    private val scaleDetector = ScaleGestureDetector(
+        context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                pxPerSec = (pxPerSec * detector.scaleFactor)
+                    .coerceIn(12f * density, 400f * density)
+                invalidate()
+                return true
+            }
+        }
+    )
+
+    private val longPress = Runnable {
+        val c = comp
+        if (c != null && !moved && trimId < 0L && !scaleDetector.isInProgress) {
+            val i = layerAt(downX, downY)
+            if (i >= 0) {
+                movingId = c.layers[i].id
+                movingDelta = 0L
+                movingRow = i
+                onSelect?.invoke(movingId)
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                invalidate()
+            }
+        }
+    }
+
+    fun setData(p: Project, c: Comp?, t: Long, selected: Long) {
+        project = p
+        comp = c
+        playhead = t
+        selectedId = selected
+        invalidate()
+    }
+
+    // ---------- geometry ----------
+
+    private fun pxPerTick(): Double = pxPerSec.toDouble() / TICKS_PER_SECOND
+
+    private fun xOf(t: Long): Float = width / 2f + ((t - playhead) * pxPerTick()).toFloat()
+
+    private fun ticksOfDx(dx: Float): Long = Math.round(dx / pxPerTick())
+
+    private fun rowTop(row: Int): Float = topPad + row * (rowH + rowGap) - scrollY
+
+    private fun clampScroll() {
+        val n = comp?.layers?.size ?: 0
+        val content = topPad + n * (rowH + rowGap) + 4f * density
+        val maxScroll = max(0f, content - height)
+        scrollY = scrollY.coerceIn(0f, maxScroll)
+    }
+
+    private fun rowAt(y: Float): Int {
+        val c = comp ?: return 0
+        val row = floor(((y + scrollY - topPad) / (rowH + rowGap)).toDouble()).toInt()
+        return row.coerceIn(0, max(0, c.layers.size - 1))
+    }
+
+    private fun layerAt(x: Float, y: Float): Int {
+        val c = comp ?: return -1
+        if (y + scrollY < topPad) return -1
+        val row = ((y + scrollY - topPad) / (rowH + rowGap)).toInt()
+        if (row < 0 || row >= c.layers.size) return -1
+        val rt = rowTop(row)
+        if (y < rt || y > rt + rowH) return -1
+        val t = playhead + ticksOfDx(x - width / 2f)
+        val l = c.layers[row]
+        return if (t >= l.inPoint && t < l.outPoint) row else -1
+    }
+
+    // 1 = left edge, 2 = right edge, 0 = none. Only the selected layer has edge handles.
+    private fun edgeAt(x: Float, y: Float): Int {
+        val c = comp ?: return 0
+        val idx = c.layers.indexOfFirst { it.id == selectedId }
+        if (idx < 0) return 0
+        val rt = rowTop(idx)
+        if (y < rt || y > rt + rowH) return 0
+        val l = c.layers[idx]
+        val left = xOf(l.inPoint)
+        val right = xOf(l.outPoint)
+        val zone = max(16f * density, min(26f * density, (right - left) / 3f))
+        val dl = abs(x - left)
+        val dr = abs(x - right)
+        if (dl <= zone && dl <= dr) return 1
+        if (dr <= zone) return 2
+        return 0
+    }
+
+    private fun secLabel(t: Long): String {
+        val totalMs = t / TICKS_PER_MS
+        val s = (totalMs / 1000L).toInt()
+        val base = String.format(Locale.US, "%d:%02d", s / 60, s % 60)
+        return if (totalMs % 1000L != 0L) "$base.5" else base
+    }
+
+    // ---------- drawing ----------
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val cx = w / 2f
+        canvas.drawColor(Color.parseColor("#15151A"))
+
+        val c = comp
+        if (c == null) {
+            canvas.drawText("No composition", 12f * density, rulerH + 20f * density, labelPaint)
+            return
+        }
+        clampScroll()
+        val k = pxPerTick()
+
+        for (i in c.layers.indices) {
+            val rt = rowTop(i)
+            if (rt + rowH < rulerH || rt > h) continue
+            canvas.drawRect(0f, rt, w, rt + rowH, rowPaint)
+        }
+
+        val x0 = xOf(0L)
+        val x1 = xOf(c.durationTicks)
+        if (x0 > 0f) canvas.drawRect(0f, rulerH, min(x0, w), h, outsidePaint)
+        if (x1 < w) canvas.drawRect(max(x1, 0f), rulerH, w, h, outsidePaint)
+
+        for (i in c.layers.indices) {
+            val l = c.layers[i]
+            var inP = l.inPoint
+            var outP = l.outPoint
+            var row = i
+            if (l.id == movingId) {
+                inP += movingDelta
+                outP += movingDelta
+                row = movingRow
+            }
+            if (l.id == trimId) {
+                if (trimEdge == 1) inP = trimTarget else outP = trimTarget
+            }
+            val rt = rowTop(row)
+            if (rt + rowH < rulerH || rt > h) continue
+            val left = xOf(inP)
+            val right = max(xOf(outP), left + 2f)
+            if (right < 0f || left > w) continue
+
+            val f = project.footage.firstOrNull { it.id == l.footageId }
+            barPaint.color = when {
+                !l.enabled -> Color.parseColor("#4A4F5C")
+                f != null && f.kind == FootageKind.IMAGE -> Color.parseColor("#2F9E6D")
+                else -> Color.parseColor("#3B5BDB")
+            }
+            rect.set(left, rt + 2f * density, right, rt + rowH - 2f * density)
+            canvas.drawRoundRect(rect, 5f * density, 5f * density, barPaint)
+
+            if (right - left > 30f * density) {
+                canvas.save()
+                canvas.clipRect(rect)
+                val tx = max(left, 0f) + 6f * density
+                canvas.drawText(l.name, tx, rt + rowH * 0.62f, textPaint)
+                canvas.restore()
+            }
+
+            if (l.id == movingId) {
+                borderPaint.color = Color.YELLOW
+                canvas.drawRoundRect(rect, 5f * density, 5f * density, borderPaint)
+            } else if (l.id == selectedId) {
+                borderPaint.color = Color.parseColor("#9DB4FF")
+                canvas.drawRoundRect(rect, 5f * density, 5f * density, borderPaint)
+                val hw = 7f * density
+                val hh = (rect.height()) * 0.6f
+                val mid = rect.centerY()
+                handleRect.set(left, mid - hh / 2f, left + hw, mid + hh / 2f)
+                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, handlePaint)
+                handleRect.set(right - hw, mid - hh / 2f, right, mid + hh / 2f)
+                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, handlePaint)
+            }
+        }
+
+        canvas.drawRect(0f, 0f, w, rulerH, rulerBgPaint)
+        val steps = doubleArrayOf(0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+        var step = 60.0
+        for (s in steps) {
+            if (s * pxPerSec >= 56f * density) {
+                step = s
+                break
+            }
+        }
+        val stepTicks = (step * TICKS_PER_SECOND).toLong()
+        val halfW = (cx / k).toLong()
+        var t = max(0L, ((playhead - halfW) / stepTicks) * stepTicks)
+        val endT = playhead + halfW + stepTicks
+        while (t <= endT) {
+            val x = xOf(t)
+            canvas.drawLine(x, rulerH * 0.55f, x, rulerH, tickPaint)
+            canvas.drawText(secLabel(t), x + 3f * density, rulerH * 0.5f, labelPaint)
+            t += stepTicks
+        }
+
+        canvas.drawLine(cx, 0f, cx, h, headPaint)
+        canvas.drawCircle(cx, 4f * density, 4f * density, headPaint)
+    }
+
+    // ---------- touch ----------
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(e)
+        val c = comp
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = e.x
+                downY = e.y
+                lastY = e.y
+                downPlayhead = playhead
+                moved = false
+                mode = 0
+                movingId = -1L
+                movingDelta = 0L
+                trimId = -1L
+                trimEdge = 0
+                val edge = edgeAt(e.x, e.y)
+                if (edge != 0 && c != null) {
+                    val l = c.layers.firstOrNull { it.id == selectedId }
+                    if (l != null) {
+                        trimId = l.id
+                        trimEdge = edge
+                        trimTarget = if (edge == 1) l.inPoint else l.outPoint
+                    }
+                }
+                if (trimId < 0L) {
+                    postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                moved = true
+                removeCallbacks(longPress)
+                trimId = -1L
+                movingId = -1L
+                lastY = e.y
+                invalidate()
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                moved = true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (e.pointerCount > 1 || scaleDetector.isInProgress) {
+                    moved = true
+                    removeCallbacks(longPress)
+                    trimId = -1L
+                    movingId = -1L
+                    lastY = e.y
+                } else if (c != null) {
+                    val dx = e.x - downX
+                    val dy = e.y - downY
+                    if (!moved && (abs(dx) > slop || abs(dy) > slop)) moved = true
+                    if (trimId >= 0L) {
+                        val l = c.layers.firstOrNull { it.id == trimId }
+                        if (l != null) {
+                            val base = if (trimEdge == 1) l.inPoint else l.outPoint
+                            val b = trimBounds(project, c, l, trimEdge)
+                            val raw = snapFrame(base + ticksOfDx(dx), c.frameRate)
+                            trimTarget = if (b.first <= b.second) raw.coerceIn(b.first, b.second) else base
+                            invalidate()
+                        }
+                    } else if (movingId >= 0L) {
+                        val l = c.layers.firstOrNull { it.id == movingId }
+                        if (l != null) {
+                            val b = moveBounds(c, l)
+                            val raw = snapFrame(ticksOfDx(dx), c.frameRate)
+                            movingDelta = if (b.first <= b.second) raw.coerceIn(b.first, b.second) else 0L
+                            movingRow = rowAt(e.y)
+                            invalidate()
+                        }
+                    } else if (moved) {
+                        removeCallbacks(longPress)
+                        if (mode == 0) mode = if (abs(dy) > abs(dx)) 2 else 1
+                        if (mode == 1) {
+                            val target = downPlayhead - ticksOfDx(dx)
+                            onScrub?.invoke(snapFrame(target, c.frameRate).coerceIn(0L, c.durationTicks))
+                        } else {
+                            scrollY -= (e.y - lastY)
+                            clampScroll()
+                            invalidate()
+                        }
+                    }
+                    lastY = e.y
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                removeCallbacks(longPress)
+                if (trimId >= 0L) {
+                    val id = trimId
+                    val ed = trimEdge
+                    val target = trimTarget
+                    trimId = -1L
+                    trimEdge = 0
+                    if (moved) onTrim?.invoke(id, ed, target)
+                    invalidate()
+                } else if (movingId >= 0L) {
+                    val id = movingId
+                    val d = movingDelta
+                    val row = movingRow
+                    movingId = -1L
+                    movingDelta = 0L
+                    onMove?.invoke(id, d, row)
+                    invalidate()
+                } else if (!moved && c != null) {
+                    val i = layerAt(e.x, e.y)
+                    onSelect?.invoke(if (i >= 0) c.layers[i].id else -1L)
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPress)
+                movingId = -1L
+                movingDelta = 0L
+                trimId = -1L
+                trimEdge = 0
+                invalidate()
+            }
+        }
+        return true
+    }
+}
