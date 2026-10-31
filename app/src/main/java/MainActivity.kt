@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.text.InputType
+import android.view.Choreographer
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
@@ -33,9 +34,48 @@ class MainActivity : Activity() {
     private lateinit var layerTimeline: LayerTimelineView
     private lateinit var timeLabel: TextView
     private lateinit var panel: PropertyPanelView
+    private lateinit var playBtn: Button
+    private lateinit var loopBtn: Button
 
     private var currentTime = 0L
     private var selectedLayerId = -1L
+
+    // playback: time follows the real clock and skips frames if the phone is slow
+    private var playing = false
+    private var loop = false
+    private var playStartNanos = 0L
+    private var playStartTicks = 0L
+    private val frameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!playing) return
+            val c = session.currentComp()
+            if (c == null) {
+                stopPlay()
+                return
+            }
+            val tpf = c.frameRate.ticksPerFrame
+            val lastFrame = maxOf(0L, c.durationTicks - tpf)
+            val elapsedMs = (frameTimeNanos - playStartNanos) / 1_000_000L
+            var t = playStartTicks + elapsedMs * TICKS_PER_MS
+            if (t >= c.durationTicks) {
+                if (loop) {
+                    playStartNanos = frameTimeNanos
+                    playStartTicks = 0L
+                    t = 0L
+                } else {
+                    currentTime = lastFrame
+                    stopPlay()
+                    updateTimeUi()
+                    pushToView()
+                    return
+                }
+            }
+            currentTime = snapFrame(t, c.frameRate).coerceAtMost(lastFrame)
+            updateTimeUi()
+            pushToView()
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -91,7 +131,10 @@ class MainActivity : Activity() {
         }
 
         panel = PropertyPanelView(this).apply {
-            onScrubStart = { session.beginGroup() }
+            onScrubStart = {
+                stopPlay()
+                session.beginGroup()
+            }
             onScrub = { path, v -> scrubValue(path, v) }
             onScrubEnd = { endScrub() }
             onTapValue = { path -> showValueDialog(path) }
@@ -107,11 +150,15 @@ class MainActivity : Activity() {
             addView(btn("Add layer") { showAddLayer() })
             addView(btn("Info") { showInfo() })
         }
+        playBtn = btn("Play") { togglePlay() }
+        loopBtn = btn("Loop") { toggleLoop() }
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            addView(playBtn)
+            addView(loopBtn)
             addView(btn("Split") { splitSelected() })
             addView(btn("Delete") { deleteSelected() })
-            addView(btn("Hide / Show") { toggleHidden() })
+            addView(btn("Hide") { toggleHidden() })
         }
         val row3 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -169,6 +216,7 @@ class MainActivity : Activity() {
     }
 
     private fun setTime(t: Long) {
+        stopPlay()
         val c = session.currentComp() ?: return
         currentTime = t.coerceIn(0L, c.durationTicks)
         refresh()
@@ -177,6 +225,47 @@ class MainActivity : Activity() {
     private fun selectLayer(id: Long) {
         selectedLayerId = id
         refresh()
+    }
+
+    // ---------- play, pause, loop ----------
+
+    private fun togglePlay() {
+        if (playing) stopPlay() else startPlay()
+    }
+
+    private fun toggleLoop() {
+        loop = !loop
+        updatePlayButtons()
+    }
+
+    private fun startPlay() {
+        val c = session.currentComp()
+        if (c == null || c.layers.isEmpty()) {
+            toast("Add a layer first")
+            return
+        }
+        if (currentTime >= c.durationTicks - c.frameRate.ticksPerFrame) currentTime = 0L
+        playing = true
+        playStartNanos = System.nanoTime()
+        playStartTicks = currentTime
+        updatePlayButtons()
+        Choreographer.getInstance().postFrameCallback(frameCallback)
+    }
+
+    private fun stopPlay() {
+        playing = false
+        Choreographer.getInstance().removeFrameCallback(frameCallback)
+        updatePlayButtons()
+    }
+
+    private fun updatePlayButtons() {
+        playBtn.text = if (playing) "Pause" else "Play"
+        loopBtn.text = if (loop) "Loop ON" else "Loop"
+    }
+
+    override fun onPause() {
+        stopPlay()
+        super.onPause()
     }
 
     // ---------- timeline edits ----------
@@ -629,6 +718,7 @@ class MainActivity : Activity() {
         l.joinToString(", ") { String.format(Locale.US, "%.1f", it) }
 
     private fun refresh() {
+        if (playing) stopPlay()
         val p = session.project
         val sb = StringBuilder()
         sb.append("PROJECT  ${p.settings.name}   (schema ${ProjectJson.SCHEMA})\n")
