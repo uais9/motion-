@@ -19,7 +19,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
@@ -31,7 +30,7 @@ class MainActivity : Activity() {
     private lateinit var session: Session
     private lateinit var report: TextView
     private lateinit var compView: CompView
-    private lateinit var timeBar: SeekBar
+    private lateinit var layerTimeline: LayerTimelineView
     private lateinit var timeLabel: TextView
 
     private var currentTime = 0L
@@ -80,22 +79,14 @@ class MainActivity : Activity() {
         timeLabel = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 12f
-            setPadding(dp(12), dp(4), dp(12), 0)
+            setPadding(dp(12), dp(4), dp(12), dp(2))
         }
-        timeBar = SeekBar(this).apply {
-            max = 1
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                    val c = session.currentComp() ?: return
-                    currentTime = ticksOfFrame(progress.toLong(), c.frameRate)
-                    updateTimeUi()
-                    pushToView()
-                }
 
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
+        layerTimeline = LayerTimelineView(this).apply {
+            onScrub = { t -> setTime(t) }
+            onSelect = { id -> selectLayer(id) }
+            onMove = { id, delta, row -> moveLayer(id, delta, row) }
+            onTrim = { id, edge, target -> trimLayer(id, edge, target) }
         }
 
         val row1 = LinearLayout(this).apply {
@@ -106,6 +97,12 @@ class MainActivity : Activity() {
             addView(btn("Layer") { showLayerSettings() })
         }
         val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("Split") { splitSelected() })
+            addView(btn("Delete") { deleteSelected() })
+            addView(btn("Hide / Show") { toggleHidden() })
+        }
+        val row3 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("Undo") {
                 if (!session.undo()) toast("Nothing to undo")
@@ -132,10 +129,11 @@ class MainActivity : Activity() {
             addView(title)
             addView(compView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.4f))
             addView(timeLabel)
-            addView(timeBar)
+            addView(layerTimeline, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(172)))
             addView(row1)
             addView(row2)
-            addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(row3)
+            addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.7f))
         }
         setContentView(root)
         refresh()
@@ -144,7 +142,9 @@ class MainActivity : Activity() {
     // ---------- preview and time ----------
 
     private fun pushToView() {
-        compView.setData(session.project, session.currentComp(), currentTime, selectedLayerId)
+        val c = session.currentComp()
+        compView.setData(session.project, c, currentTime, selectedLayerId)
+        layerTimeline.setData(session.project, c, currentTime, selectedLayerId)
     }
 
     private fun updateTimeUi() {
@@ -154,6 +154,79 @@ class MainActivity : Activity() {
         } else {
             timeLabel.text = "${timecode(currentTime, c.frameRate)}  /  ${timecode(c.durationTicks, c.frameRate)}"
         }
+    }
+
+    private fun setTime(t: Long) {
+        val c = session.currentComp() ?: return
+        currentTime = t.coerceIn(0L, c.durationTicks)
+        refresh()
+    }
+
+    private fun selectLayer(id: Long) {
+        selectedLayerId = id
+        refresh()
+    }
+
+    // ---------- timeline edits ----------
+
+    private fun moveLayer(id: Long, delta: Long, row: Int) {
+        val c = session.currentComp() ?: return
+        val idx = c.layers.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        if (delta == 0L && idx == row) return
+        session.edit { p -> p.withLayerMoved(c.id, id, delta, row) }
+        refresh()
+    }
+
+    private fun trimLayer(id: Long, edge: Int, target: Long) {
+        val c = session.currentComp() ?: return
+        val l = c.layers.firstOrNull { it.id == id } ?: return
+        val newIn = if (edge == 1) target else l.inPoint
+        val newOut = if (edge == 2) target else l.outPoint
+        if (newIn == l.inPoint && newOut == l.outPoint) return
+        if (newOut <= newIn) return
+        session.edit { p -> p.withLayerTiming(c.id, id, newIn, newOut) }
+        refresh()
+    }
+
+    private fun splitSelected() {
+        val c = session.currentComp()
+        val l = c?.layers?.firstOrNull { it.id == selectedLayerId }
+        if (c == null || l == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val tpf = c.frameRate.ticksPerFrame
+        val t = snapFrame(currentTime, c.frameRate)
+        if (t < l.inPoint + tpf || t > l.outPoint - tpf) {
+            toast("Move the playhead inside the layer")
+            return
+        }
+        session.edit { p -> p.withLayerSplit(c.id, l.id, t) }
+        refresh()
+    }
+
+    private fun deleteSelected() {
+        val c = session.currentComp()
+        val l = c?.layers?.firstOrNull { it.id == selectedLayerId }
+        if (c == null || l == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        session.edit { p -> p.withLayerRemoved(c.id, l.id) }
+        selectedLayerId = -1L
+        refresh()
+    }
+
+    private fun toggleHidden() {
+        val c = session.currentComp()
+        val l = c?.layers?.firstOrNull { it.id == selectedLayerId }
+        if (c == null || l == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        session.edit { p -> p.withLayerEnabled(c.id, l.id, !l.enabled) }
+        refresh()
     }
 
     // ---------- new composition ----------
@@ -425,7 +498,7 @@ class MainActivity : Activity() {
             .setItems(names) { _, which ->
                 val layer = comp.layers[which]
                 selectedLayerId = layer.id
-                pushToView()
+                refresh()
                 showLayerForm(comp, layer)
             }
             .show()
@@ -482,7 +555,7 @@ class MainActivity : Activity() {
     }
 
     private fun showSelfTest() {
-        val lines = SelfTest.run() + GeometryTest.run()
+        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run()
         AlertDialog.Builder(this)
             .setTitle("Self-test")
             .setMessage(lines.joinToString("\n"))
@@ -531,7 +604,8 @@ class MainActivity : Activity() {
             sb.append("\nLAYERS, top first (${c.layers.size})\n")
             for ((i, l) in c.layers.withIndex()) {
                 val t = currentTime - l.startTime
-                sb.append("  ${i + 1}. ${l.name}\n")
+                val state = if (l.enabled) "" else "   (hidden)"
+                sb.append("  ${i + 1}. ${l.name}$state\n")
                 sb.append("     in ${timecode(l.inPoint, c.frameRate)}   out ${timecode(l.outPoint, c.frameRate)}\n")
                 sb.append("     position (${fmtNums(Eval.layerValue(l, Path.POSITION, t))})   anchor (${fmtNums(Eval.layerValue(l, Path.ANCHOR, t))})\n")
                 sb.append("     scale (${fmtNums(Eval.layerValue(l, Path.SCALE, t))})%   rotation ${fmtNums(Eval.layerValue(l, Path.ROTATION, t))}   opacity ${fmtNums(Eval.layerValue(l, Path.OPACITY, t))}%\n")
@@ -540,14 +614,9 @@ class MainActivity : Activity() {
         report.text = sb.toString()
 
         if (c != null) {
-            val frames = (c.durationTicks / c.frameRate.ticksPerFrame).toInt().coerceAtLeast(1)
             if (currentTime > c.durationTicks) currentTime = 0L
-            timeBar.max = frames
-            timeBar.progress = frameOf(currentTime, c.frameRate).toInt().coerceIn(0, frames)
         } else {
             currentTime = 0L
-            timeBar.max = 1
-            timeBar.progress = 0
         }
         updateTimeUi()
         pushToView()
