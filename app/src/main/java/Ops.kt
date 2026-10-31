@@ -3,6 +3,15 @@ package com.motion
 // Every edit is a function: old project in, new project out.
 // That makes undo/redo simple and safe.
 
+private fun Project.mapComp(compId: Long, change: (Comp) -> Comp): Project =
+    copy(comps = comps.map { if (it.id == compId) change(it) else it })
+
+// Rounds a time to the nearest whole frame. All timeline edits use this.
+fun snapFrame(t: Long, fr: FrameRate): Long {
+    val tpf = fr.ticksPerFrame
+    return Math.round(t.toDouble() / tpf) * tpf
+}
+
 fun Project.withNewComp(
     name: String,
     width: Int,
@@ -64,21 +73,204 @@ fun Project.withLayer(compId: Long, footageId: Long): Project {
     )
 }
 
-// Sets fixed values on a layer's properties (typed in the Edit layer dialog).
-// Keyframe editing comes in a later phase.
+// Sets fixed values on a layer's properties (used by the Layer settings form).
+// Keyframes on a property are kept as they are.
 fun Project.withLayerValues(
     compId: Long,
     layerId: Long,
     values: Map<String, List<Double>>
-): Project {
-    val comp = comps.firstOrNull { it.id == compId } ?: return this
-    val layer = comp.layers.firstOrNull { it.id == layerId } ?: return this
-    var props = layer.props
-    for ((path, v) in values) {
-        val old = props[path]
-        props = props + (path to Prop(v, old?.keys ?: emptyList()))
+): Project = mapComp(compId) { c ->
+    c.copy(layers = c.layers.map { l ->
+        if (l.id != layerId) {
+            l
+        } else {
+            var props = l.props
+            for ((path, v) in values) {
+                val old = props[path]
+                props = props + (path to Prop(v, old?.keys ?: emptyList()))
+            }
+            l.copy(props = props)
+        }
+    })
+}
+
+// Trim: sets a layer's in and out points (comp time). The source stays where it is.
+fun Project.withLayerTiming(
+    compId: Long,
+    layerId: Long,
+    inPoint: Long,
+    outPoint: Long
+): Project = mapComp(compId) { c ->
+    c.copy(layers = c.layers.map {
+        if (it.id == layerId) it.copy(inPoint = inPoint, outPoint = outPoint) else it
+    })
+}
+
+// Move: shifts a layer in time (start, in and out together) and puts it on a new row.
+fun Project.withLayerMoved(
+    compId: Long,
+    layerId: Long,
+    deltaTicks: Long,
+    newIndex: Int
+): Project = mapComp(compId) { c ->
+    val layer = c.layers.firstOrNull { it.id == layerId }
+    if (layer == null) {
+        c
+    } else {
+        val moved = layer.copy(
+            startTime = layer.startTime + deltaTicks,
+            inPoint = layer.inPoint + deltaTicks,
+            outPoint = layer.outPoint + deltaTicks
+        )
+        val rest = c.layers.filter { it.id != layerId }
+        val idx = newIndex.coerceIn(0, rest.size)
+        c.copy(layers = rest.take(idx) + moved + rest.drop(idx))
     }
-    val newLayer = layer.copy(props = props)
-    val newComp = comp.copy(layers = comp.layers.map { if (it.id == layerId) newLayer else it })
-    return copy(comps = comps.map { if (it.id == compId) newComp else it })
+}
+
+// Split: cuts a layer in two at comp time t. The new second half sits above the first.
+// Both halves keep the same start time, so keyframes stay where they were.
+fun Project.withLayerSplit(compId: Long, layerId: Long, t: Long): Project {
+    val comp = comps.firstOrNull { it.id == compId } ?: return this
+    val idx = comp.layers.indexOfFirst { it.id == layerId }
+    if (idx < 0) return this
+    val layer = comp.layers[idx]
+    if (t <= layer.inPoint || t >= layer.outPoint) return this
+    val first = layer.copy(outPoint = t)
+    val second = layer.copy(id = nextId, inPoint = t)
+    val newLayers = comp.layers.take(idx) + second + first + comp.layers.drop(idx + 1)
+    return copy(
+        comps = comps.map { if (it.id == compId) comp.copy(layers = newLayers) else it },
+        nextId = nextId + 1
+    )
+}
+
+fun Project.withLayerRemoved(compId: Long, layerId: Long): Project = mapComp(compId) { c ->
+    c.copy(layers = c.layers.filter { it.id != layerId })
+}
+
+fun Project.withLayerEnabled(compId: Long, layerId: Long, enabled: Boolean): Project =
+    mapComp(compId) { c ->
+        c.copy(layers = c.layers.map {
+            if (it.id == layerId) it.copy(enabled = enabled) else it
+        })
+    }
+
+// How far a layer's edge may be dragged. edge: 1 = in point, 2 = out point.
+// A video can't show footage before its start or after its end.
+fun trimBounds(project: Project, comp: Comp, layer: Layer, edge: Int): Pair<Long, Long> {
+    val f = project.footage.firstOrNull { it.id == layer.footageId }
+    val tpf = comp.frameRate.ticksPerFrame
+    val isVideo = f != null && f.kind == FootageKind.VIDEO && f.durationTicks > 0L
+    return if (edge == 1) {
+        val lo = if (isVideo) maxOf(0L, layer.startTime) else 0L
+        Pair(lo, layer.outPoint - tpf)
+    } else {
+        val hi = if (isVideo && f != null) {
+            minOf(comp.durationTicks, layer.startTime + f.durationTicks)
+        } else {
+            comp.durationTicks
+        }
+        Pair(layer.inPoint + tpf, hi)
+    }
+}
+
+// How far a layer may be moved in time and still stay inside the composition.
+fun moveBounds(comp: Comp, layer: Layer): Pair<Long, Long> =
+    Pair(-layer.inPoint, comp.durationTicks - layer.outPoint)
+
+object OpsTest {
+    fun run(): List<String> {
+        val out = ArrayList<String>()
+
+        fun check(name: String, ok: Boolean) {
+            out.add((if (ok) "PASS  " else "FAIL  ") + name)
+        }
+
+        val fr = FrameRate.FPS_30
+        val sec = TICKS_PER_SECOND
+        val r = Project().withNewComp(
+            "T", 1080, 1920, fr, secondsToTicks(10.0), 0xFF000000.toInt()
+        )
+        var p = r.first
+        val compId = r.second
+        p = p.withFootage(
+            listOf(
+                Footage(0L, "v.mp4", "content://v", FootageKind.VIDEO, 576, 1024, secondsToTicks(34.8)),
+                Footage(0L, "s.mp4", "content://s", FootageKind.VIDEO, 576, 1024, secondsToTicks(5.0))
+            )
+        )
+        val longId = p.footage[0].id
+        val shortId = p.footage[1].id
+        p = p.withLayer(compId, longId)
+        val layerId = p.comps[0].layers[0].id
+
+        val split = p.withLayerSplit(compId, layerId, secondsToTicks(4.0))
+        val sl = split.comps[0].layers
+        check("split makes two layers", sl.size == 2)
+        check(
+            "second half is on top and starts at the cut",
+            sl[0].inPoint == secondsToTicks(4.0) && sl[0].outPoint == secondsToTicks(10.0)
+        )
+        check(
+            "first half ends at the cut",
+            sl[1].inPoint == 0L && sl[1].outPoint == secondsToTicks(4.0)
+        )
+        check("both halves read the same source time", sl[0].startTime == sl[1].startTime)
+        check(
+            "split ignores a cut outside the layer",
+            p.withLayerSplit(compId, layerId, secondsToTicks(12.0)).comps[0].layers.size == 1
+        )
+
+        val trimmed = p.withLayerTiming(compId, layerId, secondsToTicks(2.0), secondsToTicks(8.0))
+        val tl = trimmed.comps[0].layers[0]
+        check(
+            "trim sets in and out",
+            tl.inPoint == secondsToTicks(2.0) && tl.outPoint == secondsToTicks(8.0)
+        )
+
+        val moved = trimmed.withLayerMoved(compId, layerId, secondsToTicks(1.0), 0)
+        val ml = moved.comps[0].layers[0]
+        check(
+            "move shifts start, in and out together",
+            ml.startTime == secondsToTicks(1.0) &&
+                ml.inPoint == secondsToTicks(3.0) &&
+                ml.outPoint == secondsToTicks(9.0)
+        )
+        val reordered = split.withLayerMoved(compId, sl[0].id, 0L, 1)
+        check(
+            "moving to another row changes the stacking order",
+            reordered.comps[0].layers[1].id == sl[0].id
+        )
+
+        check("remove deletes the layer", p.withLayerRemoved(compId, layerId).comps[0].layers.isEmpty())
+        check(
+            "hide turns a layer off",
+            !p.withLayerEnabled(compId, layerId, false).comps[0].layers[0].enabled
+        )
+
+        val tpf = fr.ticksPerFrame
+        check(
+            "snap rounds to the nearest frame",
+            snapFrame(sec + tpf / 3, fr) == sec && snapFrame(sec + tpf * 2 / 3, fr) == sec + tpf
+        )
+
+        val comp = p.comps[0]
+        val longLayer = comp.layers[0]
+        val outBounds = trimBounds(p, comp, longLayer, 2)
+        check("out edge cannot pass the end of the composition", outBounds.second == comp.durationTicks)
+        val inBounds = trimBounds(p, comp, longLayer, 1)
+        check(
+            "in edge cannot pass the out point",
+            inBounds.first == 0L && inBounds.second == longLayer.outPoint - tpf
+        )
+        val p2 = p.withLayer(compId, shortId)
+        val shortLayer = p2.comps[0].layers[0]
+        val shortBounds = trimBounds(p2, p2.comps[0], shortLayer, 2)
+        check("a short video cannot be stretched past its end", shortBounds.second == secondsToTicks(5.0))
+        val mb = moveBounds(comp, tl)
+        check("moves stay inside the composition", mb.first == -tl.inPoint && mb.second == comp.durationTicks - tl.outPoint)
+
+        return out
+    }
 }
