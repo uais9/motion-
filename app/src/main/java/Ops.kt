@@ -369,3 +369,45 @@ object KeyframeTest {
         return out
     }
 }
+
+// ---------- graph editor ----------
+
+// Sets how the segment that starts at keyframe `index` moves to the next keyframe.
+fun withKeyEase(prop: Prop, index: Int, interp: Interp, ease: List<Double>): Prop {
+    if (index < 0 || index >= prop.keys.size) return prop
+    val keys = prop.keys.toMutableList()
+    keys[index] = keys[index].copy(interp = interp, ease = ease)
+    return prop.copy(keys = keys)
+}
+
+object GraphTest {
+    fun run(): List<String> {
+        val out = ArrayList<String>()
+
+        fun check(name: String, ok: Boolean) {
+            out.add((if (ok) "PASS  " else "FAIL  ") + name)
+        }
+
+        val sec = TICKS_PER_SECOND
+        val base = Prop(
+            listOf(0.0),
+            listOf(Keyframe(0L, listOf(0.0)), Keyframe(sec, listOf(100.0)))
+        )
+        val linearAt = Eval.valueAt(base, sec / 4)[0]
+        val easeIn = withKeyEase(base, 0, Interp.BEZIER, listOf(0.42, 0.0, 1.0, 1.0))
+        check("ease in starts slower than linear", Eval.valueAt(easeIn, sec / 4)[0] < linearAt)
+        val easeOut = withKeyEase(base, 0, Interp.BEZIER, listOf(0.0, 0.0, 0.58, 1.0))
+        check("ease out starts faster than linear", Eval.valueAt(easeOut, sec / 4)[0] > linearAt)
+        val held = withKeyEase(base, 0, Interp.HOLD, listOf(0.0, 0.0, 1.0, 1.0))
+        check("hold keeps the first value", Eval.valueAt(held, sec / 2)[0] == 0.0)
+        check(
+            "a segment that does not exist changes nothing",
+            withKeyEase(base, 5, Interp.HOLD, listOf(0.0, 0.0, 1.0, 1.0)) == base
+        )
+        val overshoot = withKeyEase(base, 0, Interp.BEZIER, listOf(0.3, 1.5, 0.7, 1.0))
+        check("a handle pulled up overshoots", Eval.valueAt(overshoot, sec / 2)[0] > 100.0)
+        check("only the chosen keyframe changes", easeIn.keys[1] == base.keys[1])
+
+        return out
+    }
+}

@@ -128,36 +128,63 @@ class Exporter(private val activity: Activity) {
             .build()
     }
 
+    // Writes an error and the exceptions behind it, so we can see the real cause.
+    private fun describe(e: Throwable?): String {
+        var s = ""
+        var c: Throwable? = e
+        var n = 0
+        while (c != null && n < 4) {
+            if (s.isNotEmpty()) s += "  <-  "
+            s += c.javaClass.simpleName + ": " + (c.message ?: "")
+            c = c.cause
+            n++
+        }
+        return s
+    }
+
     fun start(project: Project, comp: Comp, onFinished: (String, Boolean) -> Unit) {
+        runExport(project, comp, true, "", onFinished)
+    }
+
+    // useBase = true: a solid background picture is the bottom of the stack.
+    // If that fails it is tried again without it (the bottom layer then ignores its opacity).
+    private fun runExport(
+        project: Project,
+        comp: Comp,
+        useBase: Boolean,
+        firstError: String,
+        onFinished: (String, Boolean) -> Unit
+    ) {
         try {
             val w = comp.width and 1.inv()
             val h = comp.height and 1.inv()
             val fps = Math.round(comp.frameRate.fps).toInt().coerceIn(1, 60)
 
-            // the base: one solid picture in the background colour for the whole duration
-            val baseFile = File(activity.cacheDir, "base_background.png")
-            val bmp = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
-            bmp.eraseColor(comp.background or 0xFF000000.toInt())
-            FileOutputStream(baseFile).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            val baseItem = EditedMediaItem.Builder(
-                MediaItem.Builder().setUri(Uri.fromFile(baseFile)).setMimeType("image/png").build()
-            )
-                .setDurationUs(ticksToUs(comp.durationTicks))
-                .setFrameRate(fps)
-                .setEffects(
-                    Effects(
-                        emptyList(),
-                        listOf<Effect>(
-                            Presentation.createForWidthAndHeight(
-                                w, h, Presentation.LAYOUT_STRETCH_TO_FIT
+            val sequences = ArrayList<EditedMediaItemSequence>()
+            if (useBase) {
+                val baseFile = File(activity.cacheDir, "base_background.png")
+                val bmp = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
+                bmp.eraseColor(comp.background or 0xFF000000.toInt())
+                FileOutputStream(baseFile).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                val baseItem = EditedMediaItem.Builder(
+                    MediaItem.Builder().setUri(Uri.fromFile(baseFile)).setMimeType("image/png").build()
+                )
+                    .setDurationUs(ticksToUs(comp.durationTicks))
+                    .setFrameRate(fps)
+                    .setEffects(
+                        Effects(
+                            emptyList(),
+                            listOf<Effect>(
+                                Presentation.createForWidthAndHeight(
+                                    w, h, Presentation.LAYOUT_STRETCH_TO_FIT
+                                )
                             )
                         )
                     )
-                )
-                .build()
+                    .build()
+                sequences.add(seqOf(baseItem, 0L))
+            }
 
-            val sequences = ArrayList<EditedMediaItemSequence>()
-            sequences.add(seqOf(baseItem, 0L))
             val used = ArrayList<Layer>()
             // bottom layer first, so the top layer ends up on top
             for (l in comp.layers.filter { it.enabled }.reversed()) {
@@ -171,16 +198,17 @@ class Exporter(private val activity: Activity) {
                 return
             }
 
-            val composition = Composition.Builder(sequences)
-                .setVideoCompositorSettings(object : VideoCompositorSettings {
+            val offset = if (useBase) 1 else 0
+            val builder = Composition.Builder(sequences)
+            if (sequences.size > 1) {
+                builder.setVideoCompositorSettings(object : VideoCompositorSettings {
                     override fun getOutputSize(inputSizes: List<Size>): Size = Size(w, h)
 
                     override fun getOverlaySettings(
                         inputId: Int,
                         presentationTimeUs: Long
                     ): OverlaySettings {
-                        // input 0 is the base, the layers follow from the bottom up
-                        val idx = inputId - 1
+                        val idx = inputId - offset
                         var alpha = 1f
                         if (idx >= 0 && idx < used.size) {
                             val l = used[idx]
@@ -194,7 +222,8 @@ class Exporter(private val activity: Activity) {
                         return StaticOverlaySettings.Builder().setAlphaScale(alpha).build()
                     }
                 })
-                .build()
+            }
+            val composition = builder.build()
 
             val out = File(activity.cacheDir, "export_" + System.currentTimeMillis() + ".mp4")
             if (out.exists()) out.delete()
@@ -215,7 +244,8 @@ class Exporter(private val activity: Activity) {
                                 if (where.isEmpty()) {
                                     onFinished("Export finished but saving failed", false)
                                 } else {
-                                    onFinished("Saved to $where", true)
+                                    val note = if (useBase) "" else "  (this time without the background base)"
+                                    onFinished("Saved to $where$note", true)
                                 }
                             }
                         }
@@ -228,10 +258,15 @@ class Exporter(private val activity: Activity) {
                     ) {
                         running = false
                         transformer = null
-                        onFinished(
-                            "Export failed (code ${exportException.errorCode}): ${exportException.message}",
-                            false
-                        )
+                        val why = "code ${exportException.errorCode}: " + describe(exportException)
+                        if (useBase) {
+                            runExport(project, comp, false, why, onFinished)
+                        } else {
+                            onFinished(
+                                "Export failed.\n\nWith the base:\n$firstError\n\nWithout the base:\n$why",
+                                false
+                            )
+                        }
                     }
                 })
                 .build()
@@ -241,7 +276,7 @@ class Exporter(private val activity: Activity) {
         } catch (e: Exception) {
             running = false
             transformer = null
-            onFinished("Export setup failed: ${e.message}", false)
+            onFinished("Export setup failed: " + describe(e), false)
         }
     }
 

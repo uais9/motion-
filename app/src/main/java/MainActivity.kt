@@ -18,6 +18,7 @@ import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -34,6 +35,9 @@ class MainActivity : Activity() {
     private lateinit var layerTimeline: LayerTimelineView
     private lateinit var timeLabel: TextView
     private lateinit var panel: PropertyPanelView
+    private lateinit var graph: GraphEditorView
+    private lateinit var graphBtn: Button
+    private var graphMode = false
     private lateinit var playBtn: Button
     private lateinit var loopBtn: Button
     private lateinit var exporter: Exporter
@@ -163,6 +167,18 @@ class MainActivity : Activity() {
             addView(btn("Add layer") { showAddLayer() })
             addView(btn("Info") { showInfo() })
         }
+        graph = GraphEditorView(this).apply {
+            visibility = View.GONE
+            onEaseStart = {
+                stopPlay()
+                session.beginGroup()
+            }
+            onEase = { path, idx, interp, ease -> easeLive(path, idx, interp, ease) }
+            onEaseEnd = { endScrub() }
+            onPreset = { path, idx, interp, ease -> applyPreset(path, idx, interp, ease) }
+        }
+        graphBtn = btn("Graph") { toggleGraph() }
+
         playBtn = btn("Play") { togglePlay() }
         loopBtn = btn("Loop") { toggleLoop() }
         val row2 = LinearLayout(this).apply {
@@ -183,6 +199,7 @@ class MainActivity : Activity() {
                 if (!session.redo()) toast("Nothing to redo")
                 refresh()
             })
+            addView(graphBtn)
             addView(btn("Self-test") { showSelfTest() })
             addView(btn("Export") { startExport() })
         }
@@ -202,7 +219,25 @@ class MainActivity : Activity() {
             addView(compView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.4f))
             addView(timeLabel)
             addView(layerTimeline, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(172)))
-            addView(panel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(184)))
+            addView(
+                FrameLayout(this@MainActivity).apply {
+                    addView(
+                        panel,
+                        FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    )
+                    addView(
+                        graph,
+                        FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    )
+                },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(184))
+            )
             addView(row1)
             addView(row2)
             addView(row3)
@@ -308,9 +343,17 @@ class MainActivity : Activity() {
             return
         }
         stopPlay()
-        exporter.start(session.project, c) { msg, _ ->
-            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-            timeLabel.text = msg
+        exporter.start(session.project, c) { msg, ok ->
+            if (ok) {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                timeLabel.text = msg
+            } else {
+                AlertDialog.Builder(this)
+                    .setTitle("Export problem")
+                    .setMessage(msg)
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
         }
         if (exporter.running) timeLabel.post(exportWatcher)
     }
@@ -650,8 +693,11 @@ class MainActivity : Activity() {
         val sel = selectedPair()
         if (sel == null) {
             panel.setData(null, 0L, emptyMap())
+            graph.setData(null, 0L)
         } else {
-            panel.setData(sel.second, layerTimeNow(sel.first, sel.second), emptyMap())
+            val lt = layerTimeNow(sel.first, sel.second)
+            panel.setData(sel.second, lt, emptyMap())
+            graph.setData(sel.second, lt)
         }
     }
 
@@ -742,6 +788,33 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    private fun toggleGraph() {
+        graphMode = !graphMode
+        panel.visibility = if (graphMode) View.GONE else View.VISIBLE
+        graph.visibility = if (graphMode) View.VISIBLE else View.GONE
+        graphBtn.text = if (graphMode) "Props" else "Graph"
+    }
+
+    private fun easeLive(path: String, idx: Int, interp: Interp, ease: List<Double>) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        session.modify { p ->
+            p.withLayerProp(c.id, l.id, path) { pr -> withKeyEase(pr, idx, interp, ease) }
+        }
+        pushToView()
+    }
+
+    private fun applyPreset(path: String, idx: Int, interp: Interp, ease: List<Double>) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        session.edit { p ->
+            p.withLayerProp(c.id, l.id, path) { pr -> withKeyEase(pr, idx, interp, ease) }
+        }
+        refresh()
+    }
+
     private fun showInfo() {
         AlertDialog.Builder(this)
             .setTitle("Project info")
@@ -751,7 +824,7 @@ class MainActivity : Activity() {
     }
 
     private fun showSelfTest() {
-        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run() + KeyframeTest.run()
+        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run() + KeyframeTest.run() + GraphTest.run()
         AlertDialog.Builder(this)
             .setTitle("Self-test")
             .setMessage(lines.joinToString("\n"))

@@ -50,6 +50,7 @@ class GraphEditorView(context: Context) : View(context) {
     private var lastLayerId = -1L
     private var selPath = Path.POSITION
     private var userSeg = -1
+    private var userChose = false
 
     private val density = resources.displayMetrics.density
     private val chipH = 24f * density
@@ -84,10 +85,21 @@ class GraphEditorView(context: Context) : View(context) {
         val id = l?.id ?: -1L
         if (id != lastLayerId) {
             userSeg = -1
+            userChose = false
             lastLayerId = id
         }
         layer = l
         layerTime = lt
+        // show an animated property by default, so the graph is not empty
+        if (l != null && !userChose && l.props[selPath]?.animated != true) {
+            for (pth in PATHS) {
+                if (l.props[pth]?.animated == true) {
+                    selPath = pth
+                    userSeg = -1
+                    break
+                }
+            }
+        }
         invalidate()
     }
 
@@ -218,9 +230,9 @@ class GraphEditorView(context: Context) : View(context) {
         canvas.drawColor(Color.parseColor("#14141A"))
         val l = layer
         if (l == null) {
-            textPaint.color = Color.GRAY
+            textPaint.color = Color.parseColor("#C8CCD8")
             textPaint.textSize = 13f * density
-            canvas.drawText("Tap a layer bar, then open the graph", 12f * density, 30f * density, textPaint)
+            canvas.drawText("Tap a layer bar in the timeline first.", 14f * density, 34f * density, textPaint)
             return
         }
 
@@ -233,9 +245,12 @@ class GraphEditorView(context: Context) : View(context) {
         val r = plotRect()
         val m = if (p != null) mapping(p) else null
         if (p == null || m == null) {
-            textPaint.color = Color.GRAY
-            textPaint.textSize = 12f * density
-            canvas.drawText("Animate this property (stopwatch) and set 2 keyframes", 12f * density, r.centerY(), textPaint)
+            textPaint.color = Color.parseColor("#C8CCD8")
+            textPaint.textSize = 13f * density
+            textPaint.textAlign = Paint.Align.LEFT
+            canvas.drawText("Nothing to graph yet.", 14f * density, r.centerY() - 8f * density, textPaint)
+            canvas.drawText("Turn on the stopwatch, then set a 2nd", 14f * density, r.centerY() + 12f * density, textPaint)
+            canvas.drawText("keyframe at a different time.", 14f * density, r.centerY() + 30f * density, textPaint)
             return
         }
 
@@ -422,6 +437,7 @@ class GraphEditorView(context: Context) : View(context) {
             1 -> {
                 selPath = PATHS[targetIndex]
                 userSeg = -1
+                userChose = true
                 invalidate()
             }
             2 -> {
