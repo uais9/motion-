@@ -30,12 +30,13 @@ import kotlin.concurrent.thread
 class MainActivity : Activity() {
     private lateinit var session: Session
     private lateinit var report: TextView
-    private lateinit var compView: CompView
+    private lateinit var compView: CompGLView
     private lateinit var layerTimeline: LayerTimelineView
     private lateinit var timeLabel: TextView
     private lateinit var panel: PropertyPanelView
     private lateinit var playBtn: Button
     private lateinit var loopBtn: Button
+    private lateinit var exporter: Exporter
 
     private var currentTime = 0L
     private var selectedLayerId = -1L
@@ -77,6 +78,17 @@ class MainActivity : Activity() {
         }
     }
 
+    private val exportWatcher = object : Runnable {
+        override fun run() {
+            if (exporter.running) {
+                timeLabel.text = exporter.progressText()
+                timeLabel.postDelayed(this, 300)
+            } else {
+                updateTimeUi()
+            }
+        }
+    }
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun toast(msg: String) {
@@ -107,6 +119,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         session = Session(File(filesDir, "project.motion.json"))
         session.load()
+        exporter = Exporter(this)
 
         val title = TextView(this).apply {
             text = "Motion"
@@ -115,7 +128,7 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(8), dp(12), dp(2))
         }
 
-        compView = CompView(this)
+        compView = CompGLView(this)
 
         timeLabel = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -171,6 +184,7 @@ class MainActivity : Activity() {
                 refresh()
             })
             addView(btn("Self-test") { showSelfTest() })
+            addView(btn("Export") { startExport() })
         }
         report = TextView(this).apply {
             setTextColor(Color.parseColor("#D8D8E0"))
@@ -201,7 +215,7 @@ class MainActivity : Activity() {
 
     private fun pushToView() {
         val c = session.currentComp()
-        compView.setData(session.project, c, currentTime, selectedLayerId)
+        compView.setData(session.project, c, currentTime, selectedLayerId, playing)
         layerTimeline.setData(session.project, c, currentTime, selectedLayerId)
         updatePanel()
     }
@@ -255,6 +269,7 @@ class MainActivity : Activity() {
     private fun stopPlay() {
         playing = false
         Choreographer.getInstance().removeFrameCallback(frameCallback)
+        compView.pauseAll()
         updatePlayButtons()
     }
 
@@ -265,7 +280,39 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         stopPlay()
+        compView.onPause()
         super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        compView.onResume()
+    }
+
+    override fun onDestroy() {
+        exporter.cancel()
+        compView.releaseAll()
+        super.onDestroy()
+    }
+
+    // ---------- export ----------
+
+    private fun startExport() {
+        if (exporter.running) {
+            toast("Export already running")
+            return
+        }
+        val c = session.currentComp()
+        if (c == null || c.layers.none { it.enabled }) {
+            toast("Add a layer first")
+            return
+        }
+        stopPlay()
+        exporter.start(session.project, c) { msg, _ ->
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            timeLabel.text = msg
+        }
+        if (exporter.running) timeLabel.post(exportWatcher)
     }
 
     // ---------- timeline edits ----------
