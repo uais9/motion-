@@ -12,6 +12,7 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 // The graph editor, modelled on After Effects' value graph (EffectCraft's keyframe crate has
 // the same idea: keyframes with eased, bezier segments).
@@ -20,6 +21,8 @@ import kotlin.math.min
 //  - the segment between two keyframes is shaped with two bezier handles (influence and speed)
 //  - tap the plot to choose a segment, drag a handle to reshape it
 //  - the chips at the bottom set the segment to a preset: Linear, Ease, In, Out, In-Out or Hold
+//  - the Value | Speed switch (top right of the plot) swaps to the speed graph: the speed curve of the
+//    property, with influence (horizontal) and speed (vertical) handles, like After Effects
 class GraphEditorView(context: Context) : View(context) {
 
     private class Preset(val label: String, val interp: Interp, val ease: List<Double>)
@@ -35,9 +38,13 @@ class GraphEditorView(context: Context) : View(context) {
             Preset("In", Interp.BEZIER, listOf(0.42, 0.0, 1.0, 1.0)),
             Preset("Out", Interp.BEZIER, listOf(0.0, 0.0, 0.58, 1.0)),
             Preset("In-Out", Interp.BEZIER, listOf(0.42, 0.0, 0.58, 1.0)),
+            Preset("Easy Ease", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0)),
             Preset("Hold", Interp.HOLD, listOf(0.33, 0.0, 0.67, 1.0))
         )
         private val DEFAULT_EASE = listOf(0.33, 0.0, 0.67, 1.0)
+        // Keyframe.time is in ticks (see TICKS_PER_SECOND), so speeds come out in units per second
+        private val TIME_UNITS_PER_SEC = TICKS_PER_SECOND.toDouble()
+        private const val MIN_INFLUENCE = 0.001
     }
 
     var onEaseStart: (() -> Unit)? = null
@@ -51,12 +58,15 @@ class GraphEditorView(context: Context) : View(context) {
     private var selPath = Path.POSITION
     private var userSeg = -1
     private var userChose = false
+    private var speedMode = false
+    private var fitSegment = false // Fit seg: the plot frames only the selected segment, Fit all: the whole property
+    private var frozenMap: Mapping? = null // speed axis is locked while a speed handle is dragged
 
     private val density = resources.displayMetrics.density
     private val chipH = 24f * density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
-    // touch state: 1 top chip, 2 bottom chip, 3 handle 1, 4 handle 2, 5 plot
+    // touch state: 1 top chip, 2 bottom chip, 3 handle 1, 4 handle 2, 5 plot, 6 Value/Speed switch
     private var target = 0
     private var targetIndex = -1
     private var downX = 0f
@@ -135,8 +145,9 @@ class GraphEditorView(context: Context) : View(context) {
 
     private fun mapping(p: Prop): Mapping? {
         if (p.keys.size < 2) return null
-        val first = p.keys.first().time
-        val last = p.keys.last().time
+        val si = if (fitSegment) segIndex(p.keys) else -1
+        val first = if (si >= 0) p.keys[si].time else p.keys.first().time
+        val last = if (si >= 0) p.keys[si + 1].time else p.keys.last().time
         if (last <= first) return null
         val pad = max(1L, (last - first) / 16)
         var vmin = Double.MAX_VALUE
@@ -148,7 +159,7 @@ class GraphEditorView(context: Context) : View(context) {
                 vmax = max(vmax, v)
             }
         }
-        for (k in p.keys) {
+        for (k in (if (si >= 0) listOf(p.keys[si], p.keys[si + 1]) else p.keys)) {
             for (v in k.value) {
                 vmin = min(vmin, v)
                 vmax = max(vmax, v)
@@ -209,6 +220,102 @@ class GraphEditorView(context: Context) : View(context) {
         )
     }
 
+    private fun modeRect(i: Int, r: RectF): RectF {
+        val w = 46f * density
+        val h = 18f * density
+        val x0 = r.right - 4f * density - 3 * w + i * w
+        val y0 = r.top + 4f * density
+        return RectF(x0, y0, x0 + w - 2f * density, y0 + h)
+    }
+
+    // average speed of a segment in units per second: signed for a single number (it can go
+    // down), a length for several numbers (x, y...)
+    private fun segAvg(a: Keyframe, b: Keyframe): Double {
+        val span = (b.time - a.time).toDouble()
+        if (span <= 0.0) return 0.0
+        if (a.value.size == 1) {
+            return (b.value.getOrElse(0) { a.value[0] } - a.value[0]) / span * TIME_UNITS_PER_SEC
+        }
+        return vecLen(a, b) / span * TIME_UNITS_PER_SEC
+    }
+
+    // length of the change between two keyframes over all numbers (x, y...)
+    private fun vecLen(a: Keyframe, b: Keyframe): Double {
+        var sum = 0.0
+        for (d in a.value.indices) {
+            val dv = b.value.getOrElse(d) { a.value[d] } - a.value[d]
+            sum += dv * dv
+        }
+        return sqrt(sum)
+    }
+
+    // speed (units per second) at time t inside segment seg, measured from the evaluated values,
+    // so it always matches what the layer really does
+    private fun speedAt(p: Prop, seg: Int, t: Long): Double {
+        val a = p.keys[seg]
+        val b = p.keys[seg + 1]
+        val dt = max(1L, (b.time - a.time) / 200)
+        val t0 = max(a.time, t - dt)
+        val t1 = min(b.time, t + dt)
+        if (t1 <= t0) return 0.0
+        val v0 = Eval.valueAt(p, t0)
+        val v1 = Eval.valueAt(p, t1)
+        if (v0.size == 1) return (v1.getOrElse(0) { v0[0] } - v0[0]) / (t1 - t0) * TIME_UNITS_PER_SEC
+        var sum = 0.0
+        for (d in v0.indices) {
+            val dv = v1.getOrElse(d) { v0[d] } - v0[d]
+            sum += dv * dv
+        }
+        return sqrt(sum) / (t1 - t0) * TIME_UNITS_PER_SEC
+    }
+
+    // same time range as the value graph, the vertical axis is speed (below 0 for a property going down)
+    private fun speedMapping(p: Prop, m: Mapping): Mapping {
+        val fm = frozenMap
+        if (fm != null) return Mapping(m.t0, m.t1, fm.vmin, fm.vmax)
+        var lo = 0.0
+        var hi = 1e-6
+        val segs = if (fitSegment) {
+            listOf(segIndex(p.keys)).filter { it >= 0 }
+        } else {
+            (0 until p.keys.size - 1).toList()
+        }
+        for (seg in segs) {
+            val a = p.keys[seg]
+            val b = p.keys[seg + 1]
+            for (i in 0..40) {
+                val sp = speedAt(p, seg, a.time + (b.time - a.time) * i / 40)
+                lo = min(lo, sp)
+                hi = max(hi, sp)
+            }
+        }
+        return Mapping(m.t0, m.t1, lo * 1.15, hi * 1.15)
+    }
+
+    // speed-graph handles in screen pixels: x = influence, y = speed at the keyframe.
+    // ease = [x1, y1, x2, y2]: out influence = x1, out speed = avg * y1 / x1,
+    // in influence = 1 - x2, in speed = avg * (1 - y2) / (1 - x2), avg = average speed of the segment
+    private fun speedHandles(p: Prop, seg: Int, sm: Mapping, r: RectF): FloatArray? {
+        val a = p.keys[seg]
+        val b = p.keys[seg + 1]
+        if (a.interp != Interp.BEZIER) return null
+        val span = (b.time - a.time).toDouble()
+        val avg = segAvg(a, b)
+        if (abs(avg) < 1e-9 || span <= 0.0) return null
+        val e = easeOf(a)
+        val infOut = max(e[0], MIN_INFLUENCE)
+        val infIn = max(1.0 - e[2], MIN_INFLUENCE)
+        val speedOut = avg * e[1] / infOut
+        val speedIn = avg * (1.0 - e[3]) / infIn
+        return floatArrayOf(
+            xOf(sm, r, a.time + (infOut * span).toLong()), yOf(sm, r, speedOut),
+            xOf(sm, r, b.time - (infIn * span).toLong()), yOf(sm, r, speedIn)
+        )
+    }
+
+    private fun activeHandles(p: Prop, seg: Int, m: Mapping, r: RectF): FloatArray? =
+        if (speedMode) speedHandles(p, seg, speedMapping(p, m), r) else handles(p, seg, m, r)
+
     // ---------- drawing ----------
 
     private fun drawChip(canvas: Canvas, r: RectF, text: String, on: Boolean, enabled: Boolean) {
@@ -265,6 +372,10 @@ class GraphEditorView(context: Context) : View(context) {
             drawChip(canvas, bottomChip(i), pr.label, on, seg >= 0)
         }
 
+        // plot background
+        fillPaint.color = Color.parseColor("#1B1B24")
+        canvas.drawRect(r, fillPaint)
+
         // selected segment
         if (seg >= 0) {
             fillPaint.color = Color.parseColor("#22FFFFFF")
@@ -272,19 +383,31 @@ class GraphEditorView(context: Context) : View(context) {
         }
 
         // frame and value labels
+        val sm = if (speedMode) speedMapping(p, m) else null
         linePaint.strokeWidth = density
         linePaint.color = Color.parseColor("#33FFFFFF")
         canvas.drawRect(r, linePaint)
         textPaint.color = Color.GRAY
         textPaint.textSize = 9.5f * density
-        canvas.drawText(String.format(Locale.US, "%.0f", m.vmax), 2f * density, r.top + 8f * density, textPaint)
-        canvas.drawText(String.format(Locale.US, "%.0f", m.vmin), 2f * density, r.bottom, textPaint)
+        val hi = if (sm != null) sm.vmax else m.vmax
+        val lo = if (sm != null) sm.vmin else m.vmin
+        canvas.drawText(String.format(Locale.US, "%.0f", hi), 2f * density, r.top + 8f * density, textPaint)
+        canvas.drawText(String.format(Locale.US, "%.0f", lo), 2f * density, r.bottom, textPaint)
+        textPaint.color = Color.parseColor("#8A8FA0")
+        textPaint.textSize = 10f * density
+        canvas.drawText(if (speedMode) "Speed graph (units/s)" else "Value graph", r.left + 6f * density, r.top + 12f * density, textPaint)
 
+
+        canvas.save()
+        canvas.clipRect(r)
+        if (sm != null) {
+            drawSpeedGraph(canvas, p, sm, r, seg)
+        } else {
         // the curves
         val dims = p.keys[0].value.size
         val steps = 100
-        val firstT = p.keys.first().time
-        val lastT = p.keys.last().time
+        val firstT = max(p.keys.first().time, m.t0)
+        val lastT = min(p.keys.last().time, m.t1)
         for (d in 0 until dims) {
             linePaint.color = if (dims == 1) Color.WHITE else dimColors[min(d, dimColors.size - 1)]
             linePaint.strokeWidth = 1.8f * density
@@ -329,6 +452,33 @@ class GraphEditorView(context: Context) : View(context) {
                 canvas.drawCircle(h[2], h[3], 6f * density, fillPaint)
             }
         }
+        }
+        canvas.restore()
+
+        // say why there are no handles
+        if (seg >= 0 && activeHandles(p, seg, m, r) == null) {
+            val a = p.keys[seg]
+            val b = p.keys[seg + 1]
+            val d = referenceDim(a, b)
+            val flat = if (speedMode) {
+                abs(segAvg(a, b)) < 1e-9
+            } else {
+                abs(b.value.getOrElse(d) { 0.0 } - a.value.getOrElse(d) { 0.0 }) < 1e-9
+            }
+            val msg = if (flat) {
+                "Same value at both keyframes: change one to see a curve"
+            } else {
+                "Tap Ease, In, Out or In-Out to get handles"
+            }
+            textPaint.color = Color.parseColor("#FFD54A")
+            textPaint.textSize = 10.5f * density
+            canvas.drawText(msg, r.left + 8f * density, r.bottom - 8f * density, textPaint)
+        }
+
+        // Value | Speed switch
+        drawChip(canvas, modeRect(0, r), if (fitSegment) "Fit seg" else "Fit all", fitSegment, true)
+        drawChip(canvas, modeRect(1, r), "Value", !speedMode, true)
+        drawChip(canvas, modeRect(2, r), "Speed", speedMode, true)
 
         // playhead
         val lt = layerTime
@@ -338,6 +488,70 @@ class GraphEditorView(context: Context) : View(context) {
             val x = xOf(m, r, lt)
             canvas.drawLine(x, r.top, x, r.bottom, linePaint)
         }
+    }
+
+    private fun drawSpeedGraph(canvas: Canvas, p: Prop, sm: Mapping, r: RectF, seg: Int) {
+        // the speed curve, one segment after the other
+        linePaint.color = Color.parseColor("#B28CFF")
+        linePaint.strokeWidth = 1.8f * density
+        for (s in 0 until p.keys.size - 1) {
+            val a = p.keys[s]
+            val b = p.keys[s + 1]
+            var px = 0f
+            var py = 0f
+            for (i in 0..60) {
+                val t = a.time + (b.time - a.time) * i / 60
+                val x = xOf(sm, r, t)
+                val y = yOf(sm, r, speedAt(p, s, t))
+                if (i > 0) canvas.drawLine(px, py, x, y, linePaint)
+                px = x
+                py = y
+            }
+        }
+
+        // zero line, keyframes sit on it
+        val y0 = yOf(sm, r, 0.0)
+        linePaint.color = Color.parseColor("#44FFFFFF")
+        linePaint.strokeWidth = density
+        canvas.drawLine(r.left, y0, r.right, y0, linePaint)
+        fillPaint.color = Color.WHITE
+        for (k in p.keys) canvas.drawCircle(xOf(sm, r, k.time), y0, 3.5f * density, fillPaint)
+
+        // influence / speed handles of the selected segment
+        if (seg < 0) return
+        val h = speedHandles(p, seg, sm, r) ?: return
+        val a = p.keys[seg]
+        val b = p.keys[seg + 1]
+        val e = easeOf(a)
+        val avg = segAvg(a, b)
+        val infOut = max(e[0], MIN_INFLUENCE)
+        val infIn = max(1.0 - e[2], MIN_INFLUENCE)
+        val xa = xOf(sm, r, a.time)
+        val xb = xOf(sm, r, b.time)
+        linePaint.color = Color.parseColor("#FFD54A")
+        linePaint.strokeWidth = 1.4f * density
+        canvas.drawLine(xa, h[1], h[0], h[1], linePaint)
+        canvas.drawLine(xb, h[3], h[2], h[3], linePaint)
+        fillPaint.color = Color.parseColor("#FFD54A")
+        canvas.drawCircle(h[0], h[1], 6f * density, fillPaint)
+        canvas.drawCircle(h[2], h[3], 6f * density, fillPaint)
+        canvas.drawCircle(xa, h[1], 3f * density, fillPaint)
+        canvas.drawCircle(xb, h[3], 3f * density, fillPaint)
+
+        // numbers, like the Keyframe Velocity dialog
+        textPaint.color = Color.parseColor("#FFD54A")
+        textPaint.textSize = 9.5f * density
+        textPaint.textAlign = Paint.Align.LEFT
+        canvas.drawText(
+            String.format(Locale.US, "%.0f%%  %.0f/s", infOut * 100, avg * e[1] / infOut),
+            min(h[0] + 8f * density, r.right - 80f * density), max(h[1] - 8f * density, r.top + 24f * density), textPaint
+        )
+        textPaint.textAlign = Paint.Align.RIGHT
+        canvas.drawText(
+            String.format(Locale.US, "%.0f%%  %.0f/s", infIn * 100, avg * (1.0 - e[3]) / infIn),
+            max(h[2] - 8f * density, r.left + 80f * density), max(h[3] - 8f * density, r.top + 24f * density), textPaint
+        )
+        textPaint.textAlign = Paint.Align.LEFT
     }
 
     private fun easeNear(a: List<Double>, b: List<Double>): Boolean {
@@ -371,8 +585,15 @@ class GraphEditorView(context: Context) : View(context) {
             }
         }
         val r = plotRect()
+        for (i in 0..2) {
+            if (modeRect(i, r).contains(x, y)) {
+                target = 6
+                targetIndex = i
+                return
+            }
+        }
         if (seg >= 0) {
-            val h = handles(p, seg, m, r)
+            val h = activeHandles(p, seg, m, r)
             if (h != null) {
                 val reach = 28f * density
                 val d1 = abs(x - h[0]) + abs(y - h[1])
@@ -406,6 +627,10 @@ class GraphEditorView(context: Context) : View(context) {
                         val moved = abs(e.x - downX) > slop || abs(e.y - downY) > slop
                         if (!dragging && moved) {
                             dragging = true
+                            if (speedMode) {
+                                val m = mapping(p)
+                                if (m != null) frozenMap = speedMapping(p, m)
+                            }
                             onEaseStart?.invoke()
                         }
                         if (dragging) dragHandle(p, e.x, e.y)
@@ -420,12 +645,14 @@ class GraphEditorView(context: Context) : View(context) {
                     if (!moved) tap(e.x)
                 }
                 dragging = false
+                frozenMap = null
                 target = 0
                 invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
                 if (dragging) onEaseEnd?.invoke()
                 dragging = false
+                frozenMap = null
                 target = 0
             }
         }
@@ -447,9 +674,25 @@ class GraphEditorView(context: Context) : View(context) {
                 val pr = PRESETS[targetIndex]
                 onPreset?.invoke(selPath, seg, pr.interp, pr.ease)
             }
+            6 -> {
+                when (targetIndex) {
+                    0 -> fitSegment = !fitSegment
+                    1 -> speedMode = false
+                    else -> speedMode = true
+                }
+                invalidate()
+            }
             5 -> {
                 val p = currentProp() ?: return
                 val m = mapping(p) ?: return
+                if (fitSegment) {
+                    val seg0 = segIndex(p.keys)
+                    val frac = (x - plotRect().left) / plotRect().width()
+                    if (seg0 >= 0 && frac < 0.15f) userSeg = max(0, seg0 - 1)
+                    if (seg0 >= 0 && frac > 0.85f) userSeg = min(p.keys.size - 2, seg0 + 1)
+                    invalidate()
+                    return
+                }
                 val t = timeAt(m, plotRect(), x)
                 var i = 0
                 while (i < p.keys.size - 2 && t >= p.keys[i + 1].time) i++
@@ -463,6 +706,10 @@ class GraphEditorView(context: Context) : View(context) {
         val m = mapping(p) ?: return
         val seg = segIndex(p.keys)
         if (seg < 0) return
+        if (speedMode) {
+            dragSpeedHandle(p, m, seg, x, y)
+            return
+        }
         val a = p.keys[seg]
         val b = p.keys[seg + 1]
         val d = referenceDim(a, b)
@@ -475,6 +722,31 @@ class GraphEditorView(context: Context) : View(context) {
         val ny = ((valueAtY(m, r, y) - va) / (vb - va)).coerceIn(-1.0, 2.0)
         val e = easeOf(a)
         val next = if (target == 3) listOf(nx, ny, e[2], e[3]) else listOf(e[0], e[1], nx, ny)
+        onEase?.invoke(selPath, seg, Interp.BEZIER, next)
+    }
+
+    // dragging on the speed graph: x sets the influence, y sets the speed (never below 0),
+    // both converted back to the cubic-bezier ease [x1, y1, x2, y2] the segment is stored with
+    private fun dragSpeedHandle(p: Prop, m: Mapping, seg: Int, x: Float, y: Float) {
+        val a = p.keys[seg]
+        val b = p.keys[seg + 1]
+        val span = (b.time - a.time).toDouble()
+        val avg = segAvg(a, b)
+        if (abs(avg) < 1e-9 || span <= 0.0) return
+        val r = plotRect()
+        val sm = speedMapping(p, m)
+        val signed = a.value.size == 1
+        val raw = valueAtY(sm, r, y)
+        val speed = if (signed) raw else raw.coerceAtLeast(0.0)
+        val t = timeAt(sm, r, x)
+        val e = easeOf(a)
+        val next = if (target == 3) {
+            val inf = ((t - a.time) / span).coerceIn(MIN_INFLUENCE, 1.0)
+            listOf(inf, (inf * speed / avg).coerceIn(if (signed) -1.0 else 0.0, 2.0), e[2], e[3])
+        } else {
+            val inf = ((b.time - t) / span).coerceIn(MIN_INFLUENCE, 1.0)
+            listOf(e[0], e[1], 1.0 - inf, (1.0 - inf * speed / avg).coerceIn(-1.0, if (signed) 2.0 else 1.0))
+        }
         onEase?.invoke(selPath, seg, Interp.BEZIER, next)
     }
 }
