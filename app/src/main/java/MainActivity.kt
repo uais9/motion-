@@ -29,6 +29,7 @@ import java.util.Locale
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
+
     private lateinit var session: Session
     private lateinit var report: TextView
     private lateinit var compView: CompGLView
@@ -38,6 +39,8 @@ class MainActivity : Activity() {
     private lateinit var graph: GraphEditorView
     private lateinit var graphBtn: Button
     private var graphMode = false
+    // views that are hidden on the graph screen, so the graph can be big
+    private var chromeViews: List<View> = emptyList()
     private lateinit var playBtn: Button
     private lateinit var loopBtn: Button
     private lateinit var exporter: Exporter
@@ -50,6 +53,7 @@ class MainActivity : Activity() {
     private var loop = false
     private var playStartNanos = 0L
     private var playStartTicks = 0L
+
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!playing) return
@@ -131,22 +135,18 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             setPadding(dp(12), dp(8), dp(12), dp(2))
         }
-
         compView = CompGLView(this)
-
         timeLabel = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 12f
             setPadding(dp(12), dp(4), dp(12), dp(2))
         }
-
         layerTimeline = LayerTimelineView(this).apply {
             onScrub = { t -> setTime(t) }
             onSelect = { id -> selectLayer(id) }
             onMove = { id, delta, row -> moveLayer(id, delta, row) }
             onTrim = { id, edge, target -> trimLayer(id, edge, target) }
         }
-
         panel = PropertyPanelView(this).apply {
             onScrubStart = {
                 stopPlay()
@@ -178,7 +178,6 @@ class MainActivity : Activity() {
             onPreset = { path, idx, interp, ease -> applyPreset(path, idx, interp, ease) }
         }
         graphBtn = btn("Graph") { toggleGraph() }
-
         playBtn = btn("Play") { togglePlay() }
         loopBtn = btn("Loop") { toggleLoop() }
         val row2 = LinearLayout(this).apply {
@@ -243,6 +242,7 @@ class MainActivity : Activity() {
             addView(row3)
         }
         setContentView(root)
+        chromeViews = listOf(title, row1, row2)
         refresh()
     }
 
@@ -260,7 +260,7 @@ class MainActivity : Activity() {
         if (c == null) {
             timeLabel.text = "No composition"
         } else {
-            timeLabel.text = "${timecode(currentTime, c.frameRate)}  /  ${timecode(c.durationTicks, c.frameRate)}"
+            timeLabel.text = "${timecode(currentTime, c.frameRate)} / ${timecode(c.durationTicks, c.frameRate)}"
         }
     }
 
@@ -452,7 +452,6 @@ class MainActivity : Activity() {
             setText("10")
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
         }
-
         val presetSpinner = Spinner(this)
         presetSpinner.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item, presets
@@ -469,7 +468,6 @@ class MainActivity : Activity() {
 
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
-
         val rateSpinner = Spinner(this)
         rateSpinner.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item, rates.map { it.label() }
@@ -788,11 +786,21 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    // The graph gets its own screen: the title and the button rows are hidden,
+    // the graph takes most of the height and the preview stays on top.
     private fun toggleGraph() {
         graphMode = !graphMode
         panel.visibility = if (graphMode) View.GONE else View.VISIBLE
         graph.visibility = if (graphMode) View.VISIBLE else View.GONE
         graphBtn.text = if (graphMode) "Props" else "Graph"
+        for (v in chromeViews) v.visibility = if (graphMode) View.GONE else View.VISIBLE
+        (graph.parent as View).layoutParams = if (graphMode) {
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 3f)
+        } else {
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(184))
+        }
+        (compView.layoutParams as LinearLayout.LayoutParams).weight = if (graphMode) 0.8f else 1.4f
+        compView.requestLayout()
     }
 
     private fun easeLive(path: String, idx: Int, interp: Interp, ease: List<Double>) {
@@ -841,48 +849,44 @@ class MainActivity : Activity() {
         if (playing) stopPlay()
         val p = session.project
         val sb = StringBuilder()
-        sb.append("PROJECT  ${p.settings.name}   (schema ${ProjectJson.SCHEMA})\n")
+        sb.append("PROJECT ${p.settings.name} (schema ${ProjectJson.SCHEMA})\n")
         val warn = session.loadWarning
         if (warn != null) sb.append("! $warn\n")
         sb.append("Autosaved after every edit.\n")
-        sb.append("Undo steps: ${session.undoCount}   Redo steps: ${session.redoCount}\n\n")
-
+        sb.append("Undo steps: ${session.undoCount} Redo steps: ${session.redoCount}\n\n")
         val c = session.currentComp()
         if (c == null) {
             sb.append("No composition yet. Tap New comp.\n")
         } else {
             val bg = String.format(Locale.US, "#%06X", c.background and 0xFFFFFF)
-            sb.append("COMP  \"${c.name}\"\n")
-            sb.append("  size         ${c.width} x ${c.height}   pixel aspect ${c.pixelAspect}\n")
-            sb.append("  frame rate   ${c.frameRate.label()}   (${c.frameRate.ticksPerFrame} ticks per frame)\n")
-            sb.append("  duration     ${timecode(c.durationTicks, c.frameRate)}   (${secondsLabel(c.durationTicks)})\n")
-            sb.append("  start        ${timecode(c.startTimecode, c.frameRate)}\n")
-            sb.append("  background   $bg\n")
+            sb.append("COMP \"${c.name}\"\n")
+            sb.append("  size ${c.width} x ${c.height}  pixel aspect ${c.pixelAspect}\n")
+            sb.append("  frame rate ${c.frameRate.label()} (${c.frameRate.ticksPerFrame} ticks per frame)\n")
+            sb.append("  duration ${timecode(c.durationTicks, c.frameRate)} (${secondsLabel(c.durationTicks)})\n")
+            sb.append("  start ${timecode(c.startTimecode, c.frameRate)}\n")
+            sb.append("  background $bg\n")
             sb.append(
-                "  work area    ${secondsLabel(c.workAreaStart)} to " +
+                "  work area ${secondsLabel(c.workAreaStart)} to " +
                     "${secondsLabel(c.workAreaStart + c.workAreaDuration)}\n"
             )
         }
-
         sb.append("\nFOOTAGE (${p.footage.size})\n")
         for (f in p.footage) {
             val dur = if (f.kind == FootageKind.VIDEO) secondsLabel(f.durationTicks) else "still"
-            sb.append("  #${f.id} ${f.kind.name.lowercase()}  ${f.name}  ${f.width}x${f.height}  $dur\n")
+            sb.append("  #${f.id} ${f.kind.name.lowercase()} ${f.name} ${f.width}x${f.height} $dur\n")
         }
-
         if (c != null) {
             sb.append("\nLAYERS, top first (${c.layers.size})\n")
             for ((i, l) in c.layers.withIndex()) {
                 val t = currentTime - l.startTime
-                val state = if (l.enabled) "" else "   (hidden)"
+                val state = if (l.enabled) "" else " (hidden)"
                 sb.append("  ${i + 1}. ${l.name}$state\n")
-                sb.append("     in ${timecode(l.inPoint, c.frameRate)}   out ${timecode(l.outPoint, c.frameRate)}\n")
-                sb.append("     position (${fmtNums(Eval.layerValue(l, Path.POSITION, t))})   anchor (${fmtNums(Eval.layerValue(l, Path.ANCHOR, t))})\n")
-                sb.append("     scale (${fmtNums(Eval.layerValue(l, Path.SCALE, t))})%   rotation ${fmtNums(Eval.layerValue(l, Path.ROTATION, t))}   opacity ${fmtNums(Eval.layerValue(l, Path.OPACITY, t))}%\n")
+                sb.append("     in ${timecode(l.inPoint, c.frameRate)}  out ${timecode(l.outPoint, c.frameRate)}\n")
+                sb.append("     position (${fmtNums(Eval.layerValue(l, Path.POSITION, t))})  anchor (${fmtNums(Eval.layerValue(l, Path.ANCHOR, t))})\n")
+                sb.append("     scale (${fmtNums(Eval.layerValue(l, Path.SCALE, t))})%  rotation ${fmtNums(Eval.layerValue(l, Path.ROTATION, t))}  opacity ${fmtNums(Eval.layerValue(l, Path.OPACITY, t))}%\n")
             }
         }
         report.text = sb.toString()
-
         if (c != null) {
             if (currentTime > c.durationTicks) currentTime = 0L
         } else {
