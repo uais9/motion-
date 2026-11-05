@@ -4,13 +4,21 @@ enum class FootageKind { VIDEO, IMAGE }
 
 enum class Interp { LINEAR, HOLD, BEZIER }
 
+// How a keyframe's two handles are managed (After Effects' Bezier, Auto Bezier, Continuous Bezier):
+//  NONE       independent handles (plain Bezier)
+//  AUTO       the handles are worked out automatically, so speed is smooth through the keyframe
+//  CONTINUOUS speed coming in equals speed going out; the handles are yours to set
+// The order matters: the graph's type menu uses the position in this list.
+enum class Smooth { NONE, AUTO, CONTINUOUS }
+
 // One keyframe. For BEZIER, "ease" is a cubic-bezier (x1, y1, x2, y2)
 // that shapes the segment starting at this keyframe.
 data class Keyframe(
     val time: Long,
     val value: List<Double>,
     val interp: Interp = Interp.LINEAR,
-    val ease: List<Double> = listOf(0.33, 0.0, 0.67, 1.0)
+    val ease: List<Double> = listOf(0.33, 0.0, 0.67, 1.0),
+    val smooth: Smooth = Smooth.NONE
 )
 
 // A property is a fixed value, or a list of keyframes that animate it.

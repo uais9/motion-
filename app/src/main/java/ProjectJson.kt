@@ -118,6 +118,7 @@ object ProjectJson {
             ko.put("value", numsToJson(k.value))
             ko.put("interp", k.interp.name)
             ko.put("ease", numsToJson(k.ease))
+            ko.put("smooth", k.smooth.name)
             ka.put(ko)
         }
         o.put("keys", ka)
@@ -147,6 +148,15 @@ object ProjectJson {
             Interp.valueOf(s)
         } catch (e: Exception) {
             Interp.LINEAR
+        }
+    }
+
+    // older project files have no "smooth": those keyframes are plain Bezier
+    private fun smoothOf(s: String): Smooth {
+        return try {
+            Smooth.valueOf(s)
+        } catch (e: Exception) {
+            Smooth.NONE
         }
     }
 
@@ -215,7 +225,8 @@ object ProjectJson {
                         k.getLong("time"),
                         readNums(k.optJSONArray("value")),
                         interpOf(k.optString("interp", "LINEAR")),
-                        if (ease.size == 4) ease else listOf(0.33, 0.0, 0.67, 1.0)
+                        if (ease.size == 4) ease else listOf(0.33, 0.0, 0.67, 1.0),
+                        smoothOf(k.optString("smooth", "NONE"))
                     )
                 )
             }
