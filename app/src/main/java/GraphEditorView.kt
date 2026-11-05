@@ -1,13 +1,18 @@
 package com.motion
 
+import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.text.InputType
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
@@ -20,12 +25,16 @@ import kotlin.math.sqrt
 //  - the plot draws the property's value over time, one line per number (x, y...)
 //  - the segment between two keyframes is shaped with two bezier handles (influence and speed)
 //  - tap the plot to choose a segment, drag a handle to reshape it
-//  - the chips at the bottom set the segment to a preset: Linear, Ease, In, Out, In-Out or Hold
+//  - the chips at the bottom: Linear, Easy Ease (both ends), Ease In (arrival at the end keyframe),
+//    Ease Out (departure from the start keyframe), Hold, and Numbers (the Keyframe Velocity dialog)
+//    Easy Ease = speed 0 with 33.33% influence, as in After Effects
 //  - the Value | Speed switch (top right of the plot) swaps to the speed graph: the speed curve of the
 //    property, with influence (horizontal) and speed (vertical) handles, like After Effects
 class GraphEditorView(context: Context) : View(context) {
 
-    private class Preset(val label: String, val interp: Interp, val ease: List<Double>)
+    // side: 0 = whole segment, 1 = only the start handle (ease out), 2 = only the end handle (ease in),
+    // 3 = not a preset, opens the numbers dialog
+    private class Preset(val label: String, val interp: Interp, val ease: List<Double>, val side: Int = 0)
 
     private class Mapping(val t0: Long, val t1: Long, val vmin: Double, val vmax: Double)
 
@@ -34,12 +43,11 @@ class GraphEditorView(context: Context) : View(context) {
         private val NAMES = listOf("Position", "Scale", "Rotation", "Opacity", "Anchor")
         private val PRESETS = listOf(
             Preset("Linear", Interp.LINEAR, listOf(0.0, 0.0, 1.0, 1.0)),
-            Preset("Ease", Interp.BEZIER, listOf(0.25, 0.1, 0.25, 1.0)),
-            Preset("In", Interp.BEZIER, listOf(0.42, 0.0, 1.0, 1.0)),
-            Preset("Out", Interp.BEZIER, listOf(0.0, 0.0, 0.58, 1.0)),
-            Preset("In-Out", Interp.BEZIER, listOf(0.42, 0.0, 0.58, 1.0)),
             Preset("Easy Ease", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0)),
-            Preset("Hold", Interp.HOLD, listOf(0.33, 0.0, 0.67, 1.0))
+            Preset("Ease In", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 2),
+            Preset("Ease Out", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 1),
+            Preset("Hold", Interp.HOLD, listOf(0.33, 0.0, 0.67, 1.0)),
+            Preset("Numbers", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 3)
         )
         private val DEFAULT_EASE = listOf(0.33, 0.0, 0.67, 1.0)
         // Keyframe.time is in ticks (see TICKS_PER_SECOND), so speeds come out in units per second
@@ -366,8 +374,13 @@ class GraphEditorView(context: Context) : View(context) {
         for (i in PRESETS.indices) {
             val pr = PRESETS[i]
             var on = false
-            if (presetSel != null && presetSel.interp == pr.interp) {
-                on = pr.interp != Interp.BEZIER || easeNear(easeOf(presetSel), pr.ease)
+            if (presetSel != null && presetSel.interp == pr.interp && pr.side != 3) {
+                val e = easeOf(presetSel)
+                on = when (pr.side) {
+                    1 -> abs(e[0] - pr.ease[0]) < 0.01 && abs(e[1] - pr.ease[1]) < 0.01
+                    2 -> abs(e[2] - pr.ease[2]) < 0.01 && abs(e[3] - pr.ease[3]) < 0.01
+                    else -> pr.interp != Interp.BEZIER || easeNear(e, pr.ease)
+                }
             }
             drawChip(canvas, bottomChip(i), pr.label, on, seg >= 0)
         }
@@ -554,6 +567,71 @@ class GraphEditorView(context: Context) : View(context) {
         textPaint.textAlign = Paint.Align.LEFT
     }
 
+    // Keyframe Velocity: speed and influence, typed in. Out = leaving the start keyframe,
+    // In = arriving at the end keyframe (same numbers the speed graph handles show).
+    private fun showVelocityDialog(p: Prop, seg: Int) {
+        val a = p.keys[seg]
+        val b = p.keys[seg + 1]
+        val avg = segAvg(a, b)
+        if (abs(avg) < 1e-9) {
+            AlertDialog.Builder(context)
+                .setTitle("Keyframe Velocity")
+                .setMessage("Both keyframes have the same value, so there is no speed to set.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        val e = easeOf(a)
+        val infOut = max(e[0], MIN_INFLUENCE)
+        val infIn = max(1.0 - e[2], MIN_INFLUENCE)
+        val signed = a.value.size == 1
+        fun field(v: Double): EditText = EditText(context).apply {
+            setText(String.format(Locale.US, "%.2f", v).trimEnd('0').trimEnd('.'))
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
+        }
+        val speedOut = field(avg * e[1] / infOut)
+        val inflOut = field(infOut * 100)
+        val speedIn = field(avg * (1.0 - e[3]) / infIn)
+        val inflIn = field(infIn * 100)
+        fun row(label: String, f: EditText): LinearLayout = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(TextView(context).apply { text = label }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(f, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        val pad = (20 * density).toInt()
+        val form = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, 0)
+            addView(TextView(context).apply { text = "Outgoing (start keyframe)" })
+            addView(row("Speed (units/s)", speedOut))
+            addView(row("Influence (%)", inflOut))
+            addView(TextView(context).apply { text = "Incoming (end keyframe)"; setPadding(0, pad / 2, 0, 0) })
+            addView(row("Speed (units/s)", speedIn))
+            addView(row("Influence (%)", inflIn))
+        }
+        AlertDialog.Builder(context)
+            .setTitle("Keyframe Velocity")
+            .setView(form)
+            .setPositiveButton("Apply") { _, _ ->
+                val so = speedOut.text.toString().toDoubleOrNull()
+                val io = inflOut.text.toString().toDoubleOrNull()
+                val si = speedIn.text.toString().toDoubleOrNull()
+                val ii = inflIn.text.toString().toDoubleOrNull()
+                if (so != null && io != null && si != null && ii != null) {
+                    val fo = (io / 100.0).coerceIn(MIN_INFLUENCE, 1.0)
+                    val fi = (ii / 100.0).coerceIn(MIN_INFLUENCE, 1.0)
+                    val lo = if (signed) -1.0 else 0.0
+                    val x1 = fo
+                    val y1 = (fo * so / avg).coerceIn(lo, 2.0)
+                    val x2 = 1.0 - fi
+                    val y2 = (1.0 - fi * si / avg).coerceIn(-1.0, if (signed) 2.0 else 1.0)
+                    onPreset?.invoke(selPath, seg, Interp.BEZIER, listOf(x1, y1, x2, y2))
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun easeNear(a: List<Double>, b: List<Double>): Boolean {
         for (i in 0 until 4) {
             if (abs(a[i] - b[i]) > 0.01) return false
@@ -672,7 +750,18 @@ class GraphEditorView(context: Context) : View(context) {
                 val seg = segIndex(p.keys)
                 if (seg < 0) return
                 val pr = PRESETS[targetIndex]
-                onPreset?.invoke(selPath, seg, pr.interp, pr.ease)
+                if (pr.side == 3) {
+                    showVelocityDialog(p, seg)
+                    return
+                }
+                // a segment that is not Bezier yet starts from the Bezier that looks the same as Linear
+                val cur = if (p.keys[seg].interp == Interp.BEZIER) easeOf(p.keys[seg]) else listOf(0.3333, 0.3333, 0.6667, 0.6667)
+                val next = when (pr.side) {
+                    1 -> listOf(pr.ease[0], pr.ease[1], cur[2], cur[3])
+                    2 -> listOf(cur[0], cur[1], pr.ease[2], pr.ease[3])
+                    else -> pr.ease
+                }
+                onPreset?.invoke(selPath, seg, pr.interp, next)
             }
             6 -> {
                 when (targetIndex) {
