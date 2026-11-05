@@ -4,21 +4,19 @@ import kotlin.math.abs
 
 // The one function that answers "what is this property's value at time t?".
 // The preview, the on-screen handles, the graph and the export will all use it.
+// The easing math itself (cubicBezier) lives in Keyframes.kt with the rest of the keyframe logic.
 object Eval {
-
     fun valueAt(prop: Prop, t: Long): List<Double> {
         val k = prop.keys
         if (k.isEmpty()) return prop.value
         if (t <= k.first().time) return k.first().value
         if (t >= k.last().time) return k.last().value
-
         var i = 0
         while (i < k.size - 1 && t >= k[i + 1].time) i++
         val a = k[i]
         val b = k[i + 1]
         val span = (b.time - a.time).toDouble()
         val u = if (span <= 0.0) 1.0 else (t - a.time) / span
-
         val f = when (a.interp) {
             Interp.HOLD -> return a.value
             Interp.LINEAR -> u
@@ -40,42 +38,18 @@ object Eval {
         layer.enabled && t >= layer.inPoint && t < layer.outPoint
 
     // Cubic-bezier easing, same idea as CSS cubic-bezier(x1, y1, x2, y2).
-    fun bezier(x: Double, e: List<Double>): Double {
-        if (e.size < 4) return x
-        val x1 = e[0]
-        val y1 = e[1]
-        val x2 = e[2]
-        val y2 = e[3]
-        var lo = 0.0
-        var hi = 1.0
-        var s = x
-        for (n in 0 until 40) {
-            val bx = cubic(s, x1, x2)
-            if (abs(bx - x) < 1e-7) break
-            if (bx < x) lo = s else hi = s
-            s = (lo + hi) / 2.0
-        }
-        return cubic(s, y1, y2)
-    }
-
-    private fun cubic(s: Double, p1: Double, p2: Double): Double {
-        val m = 1.0 - s
-        return 3.0 * m * m * s * p1 + 3.0 * m * s * s * p2 + s * s * s
-    }
+    fun bezier(x: Double, e: List<Double>): Double = cubicBezier(x, e)
 }
 
 object SelfTest {
     fun run(): List<String> {
         val out = ArrayList<String>()
-
         fun check(name: String, ok: Boolean) {
-            out.add((if (ok) "PASS  " else "FAIL  ") + name)
+            out.add((if (ok) "PASS " else "FAIL ") + name)
         }
-
         fun near(a: Double, b: Double): Boolean = abs(a - b) < 1e-4
 
         val sec = TICKS_PER_SECOND
-
         val lin = Prop(
             listOf(0.0),
             listOf(Keyframe(0L, listOf(0.0)), Keyframe(sec, listOf(100.0)))
@@ -134,7 +108,6 @@ object SelfTest {
         val back = ProjectJson.decode(ProjectJson.encode(p)).project
         check("save and load gives the same project", back == p)
         check("new layer is on top and fitted", comp.layers.size == 1 && comp.layers[0].props.containsKey(Path.SCALE))
-
         return out
     }
 }
