@@ -17,30 +17,35 @@ import kotlin.math.max
 import kotlin.math.min
 
 // The timeline: one row per layer, top layer first.
-//  - drag empty space sideways: move the playhead
-//  - drag up or down: scroll the rows
-//  - tap a bar: select it
-//  - drag a selected bar's edges: trim it
-//  - long-press a bar, then drag: move it in time, or to another row (stacking order)
-//  - pinch: zoom
+// - drag empty space sideways: move the playhead
+// - drag up or down: scroll the rows
+// - tap a bar: select it
+// - drag a selected bar's edges: trim it
+// - long-press a bar, then drag: move it in time, or to another row (stacking order)
+// - pinch: zoom
+// - keyframe diamonds of the selected layer: tap one to select it (tap again to deselect, tap
+//   several to select several), drag a selected one to move all selected keyframes in time
 // Every edit snaps to whole frames.
 class LayerTimelineView(context: Context) : View(context) {
+
     private var project: Project = Project()
     private var comp: Comp? = null
     private var playhead = 0L
     private var selectedId = -1L
+    private var selKeys: Set<Long> = emptySet() // layer times of the selected keyframes (selected layer)
 
     var onScrub: ((Long) -> Unit)? = null
     var onSelect: ((Long) -> Unit)? = null
     var onMove: ((Long, Long, Int) -> Unit)? = null
     var onTrim: ((Long, Int, Long) -> Unit)? = null
+    var onKeySelect: ((Long, Boolean) -> Unit)? = null // layer time, true = toggle it, false = select only it
+    var onKeysMove: ((Long) -> Unit)? = null // how far the selected keyframes moved, in ticks
 
     private val density = resources.displayMetrics.density
     private val rulerH = 22f * density
     private val rowH = 34f * density
     private val rowGap = 3f * density
     private val topPad = rulerH + 4f * density
-
     private var pxPerSec = 70f * density
     private var scrollY = 0f
 
@@ -56,6 +61,9 @@ class LayerTimelineView(context: Context) : View(context) {
     private var trimId = -1L
     private var trimEdge = 0
     private var trimTarget = 0L
+    private var keyHit = NO_KEY
+    private var keyDragging = false
+    private var keyDelta = 0L
 
     private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private val rect = RectF()
@@ -79,7 +87,6 @@ class LayerTimelineView(context: Context) : View(context) {
         color = Color.WHITE
         isAntiAlias = true
     }
-
     private val tickPaint = Paint().apply {
         color = Color.GRAY
         strokeWidth = density
@@ -114,7 +121,7 @@ class LayerTimelineView(context: Context) : View(context) {
 
     private val longPress = Runnable {
         val c = comp
-        if (c != null && !moved && trimId < 0L && !scaleDetector.isInProgress) {
+        if (c != null && !moved && trimId < 0L && keyHit == NO_KEY && !scaleDetector.isInProgress) {
             val i = layerAt(downX, downY)
             if (i >= 0) {
                 movingId = c.layers[i].id
@@ -127,11 +134,12 @@ class LayerTimelineView(context: Context) : View(context) {
         }
     }
 
-    fun setData(p: Project, c: Comp?, t: Long, selected: Long) {
+    fun setData(p: Project, c: Comp?, t: Long, selected: Long, keys: Set<Long> = emptySet()) {
         project = p
         comp = c
         playhead = t
         selectedId = selected
+        selKeys = keys
         invalidate()
     }
 
@@ -188,6 +196,30 @@ class LayerTimelineView(context: Context) : View(context) {
         return 0
     }
 
+    // the keyframe diamond of the selected layer under the finger: its layer time, or NO_KEY
+    private fun keyAt(x: Float, y: Float): Long {
+        val c = comp ?: return NO_KEY
+        val idx = c.layers.indexOfFirst { it.id == selectedId }
+        if (idx < 0) return NO_KEY
+        val l = c.layers[idx]
+        val ky = rowTop(idx) + rowH - 9f * density
+        if (abs(y - ky) > 17f * density) return NO_KEY
+        var best = NO_KEY
+        var bestDx = Float.MAX_VALUE
+        for (prop in l.props.values) {
+            for (key in prop.keys) {
+                val kt = l.startTime + key.time
+                if (kt < l.inPoint || kt > l.outPoint) continue
+                val dx = abs(x - xOf(kt))
+                if (dx <= 19f * density && dx < bestDx) {
+                    bestDx = dx
+                    best = key.time
+                }
+            }
+        }
+        return best
+    }
+
     private fun secLabel(t: Long): String {
         val totalMs = t / TICKS_PER_MS
         val s = (totalMs / 1000L).toInt()
@@ -203,7 +235,6 @@ class LayerTimelineView(context: Context) : View(context) {
         val h = height.toFloat()
         val cx = w / 2f
         canvas.drawColor(Color.parseColor("#15151A"))
-
         val c = comp
         if (c == null) {
             canvas.drawText("No composition", 12f * density, rulerH + 20f * density, labelPaint)
@@ -250,7 +281,6 @@ class LayerTimelineView(context: Context) : View(context) {
             }
             rect.set(left, rt + 2f * density, right, rt + rowH - 2f * density)
             canvas.drawRoundRect(rect, 5f * density, 5f * density, barPaint)
-
             if (right - left > 30f * density) {
                 canvas.save()
                 canvas.clipRect(rect)
@@ -259,15 +289,21 @@ class LayerTimelineView(context: Context) : View(context) {
                 canvas.restore()
             }
 
-            // keyframe diamonds (keyframe times are measured from the layer's start time)
+            // keyframe diamonds (keyframe times are measured from the layer's start time);
+            // the selected ones are yellow and follow the finger while they are dragged
             val shift = if (l.id == movingId) movingDelta else 0L
+            val isSel = l.id == selectedId
             for (prop in l.props.values) {
                 for (key in prop.keys) {
-                    val kt = l.startTime + key.time + shift
+                    val picked = isSel && key.time in selKeys
+                    val dragShift = if (picked && keyDragging) keyDelta else 0L
+                    val kt = l.startTime + key.time + shift + dragShift
                     if (kt < inP || kt > outP) continue
-                    drawDiamond(canvas, xOf(kt), rect.bottom - 7f * density, 4.5f * density)
+                    diamondPaint.color = if (picked) Color.parseColor("#FFD54A") else Color.WHITE
+                    drawDiamond(canvas, xOf(kt), rect.bottom - 7f * density, (if (picked) 6f else 4.5f) * density)
                 }
             }
+            diamondPaint.color = Color.WHITE
 
             if (l.id == movingId) {
                 borderPaint.color = Color.YELLOW
@@ -304,7 +340,6 @@ class LayerTimelineView(context: Context) : View(context) {
             canvas.drawText(secLabel(t), x + 3f * density, rulerH * 0.5f, labelPaint)
             t += stepTicks
         }
-
         canvas.drawLine(cx, 0f, cx, h, headPaint)
         canvas.drawCircle(cx, 4f * density, 4f * density, headPaint)
     }
@@ -336,16 +371,21 @@ class LayerTimelineView(context: Context) : View(context) {
                 movingDelta = 0L
                 trimId = -1L
                 trimEdge = 0
-                val edge = edgeAt(e.x, e.y)
-                if (edge != 0 && c != null) {
-                    val l = c.layers.firstOrNull { it.id == selectedId }
-                    if (l != null) {
-                        trimId = l.id
-                        trimEdge = edge
-                        trimTarget = if (edge == 1) l.inPoint else l.outPoint
+                keyHit = keyAt(e.x, e.y)
+                keyDragging = false
+                keyDelta = 0L
+                if (keyHit == NO_KEY) {
+                    val edge = edgeAt(e.x, e.y)
+                    if (edge != 0 && c != null) {
+                        val l = c.layers.firstOrNull { it.id == selectedId }
+                        if (l != null) {
+                            trimId = l.id
+                            trimEdge = edge
+                            trimTarget = if (edge == 1) l.inPoint else l.outPoint
+                        }
                     }
                 }
-                if (trimId < 0L) {
+                if (trimId < 0L && keyHit == NO_KEY) {
                     postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
                 }
             }
@@ -354,6 +394,9 @@ class LayerTimelineView(context: Context) : View(context) {
                 removeCallbacks(longPress)
                 trimId = -1L
                 movingId = -1L
+                keyHit = NO_KEY
+                keyDragging = false
+                keyDelta = 0L
                 lastY = e.y
                 invalidate()
             }
@@ -366,6 +409,9 @@ class LayerTimelineView(context: Context) : View(context) {
                     removeCallbacks(longPress)
                     trimId = -1L
                     movingId = -1L
+                    keyHit = NO_KEY
+                    keyDragging = false
+                    keyDelta = 0L
                     lastY = e.y
                 } else if (c != null) {
                     val dx = e.x - downX
@@ -387,6 +433,23 @@ class LayerTimelineView(context: Context) : View(context) {
                             val raw = snapFrame(ticksOfDx(dx), c.frameRate)
                             movingDelta = if (b.first <= b.second) raw.coerceIn(b.first, b.second) else 0L
                             movingRow = rowAt(e.y)
+                            invalidate()
+                        }
+                    } else if (keyHit != NO_KEY) {
+                        removeCallbacks(longPress)
+                        if (moved) {
+                            if (!keyDragging) {
+                                keyDragging = true
+                                // dragging a keyframe that is not selected selects just that one
+                                if (keyHit !in selKeys) onKeySelect?.invoke(keyHit, false)
+                            }
+                            val l = c.layers.firstOrNull { it.id == selectedId }
+                            if (l != null && selKeys.isNotEmpty()) {
+                                val raw = snapFrame(ticksOfDx(dx), c.frameRate)
+                                val lo = -(l.startTime + (selKeys.minOrNull() ?: 0L))
+                                val hi = c.durationTicks - (l.startTime + (selKeys.maxOrNull() ?: 0L))
+                                keyDelta = if (lo <= hi) raw.coerceIn(lo, hi) else 0L
+                            }
                             invalidate()
                         }
                     } else if (moved) {
@@ -422,6 +485,19 @@ class LayerTimelineView(context: Context) : View(context) {
                     movingDelta = 0L
                     onMove?.invoke(id, d, row)
                     invalidate()
+                } else if (keyHit != NO_KEY) {
+                    val hit = keyHit
+                    val d = keyDelta
+                    val wasDragging = keyDragging
+                    keyHit = NO_KEY
+                    keyDragging = false
+                    keyDelta = 0L
+                    if (wasDragging) {
+                        if (d != 0L) onKeysMove?.invoke(d)
+                    } else if (!moved) {
+                        onKeySelect?.invoke(hit, true)
+                    }
+                    invalidate()
                 } else if (!moved && c != null) {
                     val i = layerAt(e.x, e.y)
                     onSelect?.invoke(if (i >= 0) c.layers[i].id else -1L)
@@ -433,9 +509,16 @@ class LayerTimelineView(context: Context) : View(context) {
                 movingDelta = 0L
                 trimId = -1L
                 trimEdge = 0
+                keyHit = NO_KEY
+                keyDragging = false
+                keyDelta = 0L
                 invalidate()
             }
         }
         return true
+    }
+
+    private companion object {
+        const val NO_KEY = Long.MIN_VALUE
     }
 }
