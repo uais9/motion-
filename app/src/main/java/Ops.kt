@@ -89,7 +89,7 @@ fun Project.withLayerValues(
             var props = l.props
             for ((path, v) in values) {
                 val old = props[path]
-                props = props + (path to Prop(v, old?.keys ?: emptyList()))
+                props = props + (path to (old?.copy(value = v) ?: Prop(v)))
             }
             l.copy(props = props)
         }

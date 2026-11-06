@@ -22,6 +22,11 @@ object Eval {
             Interp.LINEAR -> u
             Interp.BEZIER -> bezier(u, a.ease)
         }
+        // Position and Anchor follow their motion path; f (the speed along it) comes from the ease
+        if (prop.spatial) {
+            val onPath = spatialPoint(k, i, f)
+            if (onPath != null) return onPath
+        }
         return a.value.indices.map { j ->
             val from = a.value[j]
             val to = b.value.getOrElse(j) { from }

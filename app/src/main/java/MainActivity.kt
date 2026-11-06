@@ -137,8 +137,9 @@ class MainActivity : Activity() {
         }
         compView = CompGLView(this)
         timeLabel = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            textSize = 12f
+            setTextColor(Color.parseColor("#4DA3FF"))
+            typeface = Typeface.MONOSPACE
+            textSize = 14f
             setPadding(dp(12), dp(4), dp(12), dp(2))
         }
         layerTimeline = LayerTimelineView(this).apply {
@@ -176,6 +177,11 @@ class MainActivity : Activity() {
             onEase = { path, idx, interp, ease -> easeLive(path, idx, interp, ease) }
             onEaseEnd = { endScrub() }
             onPreset = { path, idx, interp, ease -> applyPreset(path, idx, interp, ease) }
+            onKeyMove = { path, idx, t, v -> moveKeyLive(path, idx, t, v) }
+            onSmooth = { path, idx, sm -> applySmooth(path, idx, sm) }
+            onBounce = { path, idx, n, bounciness -> applyBounce(path, idx, n, bounciness) }
+            onTangent = { path, idx, isOut, vec -> moveTangentLive(path, idx, isOut, vec) }
+            onPathType = { path, seg, type -> applyPathType(path, seg, type) }
         }
         graphBtn = btn("Graph") { toggleGraph() }
         playBtn = btn("Play") { togglePlay() }
@@ -212,7 +218,7 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#101014"))
+            setBackgroundColor(Color.parseColor("#232323"))
             fitsSystemWindows = true
             addView(title)
             addView(compView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.4f))
@@ -799,8 +805,12 @@ class MainActivity : Activity() {
         } else {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(184))
         }
-        (compView.layoutParams as LinearLayout.LayoutParams).weight = if (graphMode) 0.8f else 1.4f
+        // like After Effects: preview on top, then a compact layer list, then the graph editor panel
+        (compView.layoutParams as LinearLayout.LayoutParams).weight = if (graphMode) 0.9f else 1.4f
         compView.requestLayout()
+        layerTimeline.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, if (graphMode) dp(96) else dp(172)
+        )
     }
 
     private fun easeLive(path: String, idx: Int, interp: Interp, ease: List<Double>) {
@@ -819,6 +829,62 @@ class MainActivity : Activity() {
         val l = sel.second
         session.edit { p ->
             p.withLayerProp(c.id, l.id, path) { pr -> withKeyEase(pr, idx, interp, ease) }
+        }
+        refresh()
+    }
+
+    // dragging a keyframe in the graph: time snaps to whole frames, no undo step until you let go
+    private fun moveKeyLive(path: String, idx: Int, t: Long, v: List<Double>) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        val tpf = c.frameRate.ticksPerFrame
+        val lt = snapFrame(t + l.startTime, c.frameRate) - l.startTime
+        val vals = if (path == Path.OPACITY) v.map { it.coerceIn(0.0, 100.0) } else v
+        session.modify { p ->
+            p.withLayerProp(c.id, l.id, path) { pr -> moveKey(pr, idx, lt, vals, tpf) }
+        }
+        pushToView()
+    }
+
+    // dragging a motion path handle: no undo step until you let go
+    private fun moveTangentLive(path: String, idx: Int, isOut: Boolean, vec: List<Double>) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        session.modify { p ->
+            p.withLayerProp(c.id, l.id, path) { pr -> withKeyTangent(pr, idx, isOut, vec) }
+        }
+        pushToView()
+    }
+
+    private fun applyPathType(path: String, seg: Int, type: PathType) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        session.edit { p ->
+            p.withLayerProp(c.id, l.id, path) { pr -> withSegmentPathType(pr, seg, type) }
+        }
+        refresh()
+    }
+
+    private fun applySmooth(path: String, idx: Int, smooth: Smooth) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        session.edit { p ->
+            p.withLayerProp(c.id, l.id, path) { pr -> withKeySmooth(pr, idx, smooth) }
+        }
+        refresh()
+    }
+
+    private fun applyBounce(path: String, idx: Int, bounces: Int, bounciness: Double) {
+        val sel = selectedPair() ?: return
+        val c = sel.first
+        val l = sel.second
+        val tpf = c.frameRate.ticksPerFrame
+        session.edit { p ->
+            p.withLayerProp(c.id, l.id, path) { pr -> withBounce(pr, idx, bounces, bounciness, tpf) }
         }
         refresh()
     }

@@ -111,6 +111,7 @@ object ProjectJson {
     private fun propToJson(p: Prop): JSONObject {
         val o = JSONObject()
         o.put("value", numsToJson(p.value))
+        o.put("spatial", p.spatial)
         val ka = JSONArray()
         for (k in p.keys) {
             val ko = JSONObject()
@@ -119,6 +120,9 @@ object ProjectJson {
             ko.put("interp", k.interp.name)
             ko.put("ease", numsToJson(k.ease))
             ko.put("smooth", k.smooth.name)
+            ko.put("pathType", k.pathType.name)
+            ko.put("inTan", numsToJson(k.inTan))
+            ko.put("outTan", numsToJson(k.outTan))
             ka.put(ko)
         }
         o.put("keys", ka)
@@ -157,6 +161,15 @@ object ProjectJson {
             Smooth.valueOf(s)
         } catch (e: Exception) {
             Smooth.NONE
+        }
+    }
+
+    // older project files have no "pathType": the motion path is Auto Bezier, like After Effects
+    private fun pathTypeOf(s: String): PathType {
+        return try {
+            PathType.valueOf(s)
+        } catch (e: Exception) {
+            PathType.AUTO
         }
     }
 
@@ -199,7 +212,7 @@ object ProjectJson {
         val props = LinkedHashMap<String, Prop>()
         val po = o.optJSONObject("props")
         if (po != null) {
-            for (key in po.keys()) props[key] = propFromJson(po.getJSONObject(key))
+            for (key in po.keys()) props[key] = propFromJson(po.getJSONObject(key), key == Path.POSITION || key == Path.ANCHOR)
         }
         return Layer(
             id = o.getLong("id"),
@@ -213,7 +226,7 @@ object ProjectJson {
         )
     }
 
-    private fun propFromJson(o: JSONObject): Prop {
+    private fun propFromJson(o: JSONObject, defaultSpatial: Boolean): Prop {
         val keys = ArrayList<Keyframe>()
         val ka = o.optJSONArray("keys")
         if (ka != null) {
@@ -226,11 +239,14 @@ object ProjectJson {
                         readNums(k.optJSONArray("value")),
                         interpOf(k.optString("interp", "LINEAR")),
                         if (ease.size == 4) ease else listOf(0.33, 0.0, 0.67, 1.0),
-                        smoothOf(k.optString("smooth", "NONE"))
+                        smoothOf(k.optString("smooth", "NONE")),
+                        pathTypeOf(k.optString("pathType", "AUTO")),
+                        readNums(k.optJSONArray("inTan")),
+                        readNums(k.optJSONArray("outTan"))
                     )
                 )
             }
         }
-        return Prop(readNums(o.optJSONArray("value")), keys)
+        return Prop(readNums(o.optJSONArray("value")), keys, o.optBoolean("spatial", defaultSpatial))
     }
 }

@@ -11,6 +11,13 @@ enum class Interp { LINEAR, HOLD, BEZIER }
 // The order matters: the graph's type menu uses the position in this list.
 enum class Smooth { NONE, AUTO, CONTINUOUS }
 
+// Spatial interpolation: the shape of the motion path through a keyframe of Position or Anchor.
+//  LINEAR     straight lines
+//  AUTO       a smooth curve, worked out for you (After Effects' default)
+//  CONTINUOUS you set the handles, the two stay in line so the path is smooth through the keyframe
+//  BEZIER     two independent handles (the path can turn a corner)
+enum class PathType { LINEAR, AUTO, CONTINUOUS, BEZIER }
+
 // One keyframe. For BEZIER, "ease" is a cubic-bezier (x1, y1, x2, y2)
 // that shapes the segment starting at this keyframe.
 data class Keyframe(
@@ -18,13 +25,18 @@ data class Keyframe(
     val value: List<Double>,
     val interp: Interp = Interp.LINEAR,
     val ease: List<Double> = listOf(0.33, 0.0, 0.67, 1.0),
-    val smooth: Smooth = Smooth.NONE
+    val smooth: Smooth = Smooth.NONE,
+    // motion path (only for a spatial Prop): inTan / outTan are the handles, as offsets from the keyframe's value
+    val pathType: PathType = PathType.AUTO,
+    val inTan: List<Double> = emptyList(),
+    val outTan: List<Double> = emptyList()
 )
 
 // A property is a fixed value, or a list of keyframes that animate it.
 data class Prop(
     val value: List<Double>,
-    val keys: List<Keyframe> = emptyList()
+    val keys: List<Keyframe> = emptyList(),
+    val spatial: Boolean = false // Position and Anchor move along a motion path
 ) {
     val animated: Boolean get() = keys.isNotEmpty()
 }
@@ -93,8 +105,8 @@ fun defaultTransform(f: Footage, c: Comp): Map<String, Prop> {
     val fh = maxOf(f.height, 1).toDouble()
     val fit = minOf(c.width / fw, c.height / fh) * 100.0
     return mapOf(
-        Path.ANCHOR to Prop(listOf(fw / 2.0, fh / 2.0)),
-        Path.POSITION to Prop(listOf(c.width / 2.0, c.height / 2.0)),
+        Path.ANCHOR to Prop(listOf(fw / 2.0, fh / 2.0), spatial = true),
+        Path.POSITION to Prop(listOf(c.width / 2.0, c.height / 2.0), spatial = true),
         Path.SCALE to Prop(listOf(fit, fit)),
         Path.ROTATION to Prop(listOf(0.0)),
         Path.OPACITY to Prop(listOf(100.0))

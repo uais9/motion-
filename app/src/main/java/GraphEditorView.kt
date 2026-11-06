@@ -10,8 +10,10 @@ import android.text.InputType
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import java.util.Locale
 import kotlin.math.abs
@@ -33,7 +35,7 @@ import kotlin.math.sqrt
 class GraphEditorView(context: Context) : View(context) {
 
     // side: 0 = whole segment, 1 = only the start handle (ease out), 2 = only the end handle (ease in),
-    // 3 = not a preset, opens the numbers dialog
+    // 3 = not a preset, opens the numbers dialog, 4 = not a preset, opens the bounce dialog
     private class Preset(val label: String, val interp: Interp, val ease: List<Double>, val side: Int = 0)
 
     private class Mapping(val t0: Long, val t1: Long, val vmin: Double, val vmax: Double)
@@ -47,18 +49,28 @@ class GraphEditorView(context: Context) : View(context) {
             Preset("Ease In", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 2),
             Preset("Ease Out", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 1),
             Preset("Hold", Interp.HOLD, listOf(0.33, 0.0, 0.67, 1.0)),
-            Preset("Numbers", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 3)
+            Preset("Numbers", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 3),
+            Preset("Bounce", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 4)
         )
         private val DEFAULT_EASE = listOf(0.33, 0.0, 0.67, 1.0)
         // Keyframe.time is in ticks (see TICKS_PER_SECOND), so speeds come out in units per second
         private val TIME_UNITS_PER_SEC = TICKS_PER_SECOND.toDouble()
         private const val MIN_INFLUENCE = 0.001
+        // the position in this list matches the keyframe type menu: Bezier, Auto Bezier, Continuous Bezier
+        private val SMOOTHS = arrayOf(Smooth.NONE, Smooth.AUTO, Smooth.CONTINUOUS)
+        // chips at the bottom in Path mode: they set both keyframes of the selected segment
+        private val PATH_CHIPS = listOf("Linear" to PathType.LINEAR, "Auto" to PathType.AUTO, "Continuous" to PathType.CONTINUOUS, "Bezier" to PathType.BEZIER)
     }
 
     var onEaseStart: (() -> Unit)? = null
     var onEase: ((String, Int, Interp, List<Double>) -> Unit)? = null
     var onEaseEnd: (() -> Unit)? = null
     var onPreset: ((String, Int, Interp, List<Double>) -> Unit)? = null
+    var onKeyMove: ((String, Int, Long, List<Double>) -> Unit)? = null // path, key index, layer time, value
+    var onSmooth: ((String, Int, Smooth) -> Unit)? = null // path, key index, type
+    var onBounce: ((String, Int, Int, Double) -> Unit)? = null // path, segment index, bounces, bounciness
+    var onTangent: ((String, Int, Boolean, List<Double>) -> Unit)? = null // path, key index, true = outgoing handle, offset from the keyframe
+    var onPathType: ((String, Int, PathType) -> Unit)? = null // path, segment index (both keyframes), type
 
     private var layer: Layer? = null
     private var layerTime = 0L
@@ -66,7 +78,12 @@ class GraphEditorView(context: Context) : View(context) {
     private var selPath = Path.POSITION
     private var userSeg = -1
     private var userChose = false
-    private var speedMode = false
+    private var speedMode = true // Auto-Select Graph Type: speed graph for Position and Anchor, value graph for the rest
+    private var autoType = true
+    private var pathMode = false // the motion path of Position / Anchor, drawn in x and y
+    private var frozenPath: PathMap? = null
+    private var showReference = false
+    private var showInOut = false
     private var fitSegment = false // Fit seg: the plot frames only the selected segment, Fit all: the whole property
     private var frozenMap: Mapping? = null // speed axis is locked while a speed handle is dragged
 
@@ -80,6 +97,8 @@ class GraphEditorView(context: Context) : View(context) {
     private var downX = 0f
     private var downY = 0f
     private var dragging = false
+    private var keyDim = 0 // which curve (x, y...) the dragged keyframe was grabbed on
+    private var frozenValue: Mapping? = null // value axis is locked while a keyframe is dragged
 
     private val fillPaint = Paint().apply {
         style = Paint.Style.FILL
@@ -114,6 +133,7 @@ class GraphEditorView(context: Context) : View(context) {
                 if (l.props[pth]?.animated == true) {
                     selPath = pth
                     userSeg = -1
+                    applyAutoType()
                     break
                 }
             }
@@ -152,6 +172,8 @@ class GraphEditorView(context: Context) : View(context) {
     private fun bottomChip(i: Int): RectF = chipRect(i, PRESETS.size, height - chipH - 2f * density)
 
     private fun mapping(p: Prop): Mapping? {
+        val fv = frozenValue
+        if (fv != null) return fv
         if (p.keys.size < 2) return null
         val si = if (fitSegment) segIndex(p.keys) else -1
         val first = if (si >= 0) p.keys[si].time else p.keys.first().time
@@ -229,25 +251,18 @@ class GraphEditorView(context: Context) : View(context) {
     }
 
     private fun modeRect(i: Int, r: RectF): RectF {
-        val w = 46f * density
+        val w = 36f * density
         val h = 18f * density
-        val x0 = r.right - 4f * density - 3 * w + i * w
+        val x0 = r.right - 4f * density - 5 * w + i * w
         val y0 = r.top + 4f * density
         return RectF(x0, y0, x0 + w - 2f * density, y0 + h)
     }
 
     // average speed of a segment in units per second: signed for a single number (it can go
     // down), a length for several numbers (x, y...)
-    private fun segAvg(a: Keyframe, b: Keyframe): Double {
-        val span = (b.time - a.time).toDouble()
-        if (span <= 0.0) return 0.0
-        if (a.value.size == 1) {
-            return (b.value.getOrElse(0) { a.value[0] } - a.value[0]) / span * TIME_UNITS_PER_SEC
-        }
-        return vecLen(a, b) / span * TIME_UNITS_PER_SEC
-    }
+    // average speed of segment seg in units per second, along the motion path for a curved Position
+    private fun segAvg(p: Prop, seg: Int): Double = segmentAvg(p, seg) * TIME_UNITS_PER_SEC
 
-    // length of the change between two keyframes over all numbers (x, y...)
     private fun vecLen(a: Keyframe, b: Keyframe): Double {
         var sum = 0.0
         for (d in a.value.indices) {
@@ -308,7 +323,7 @@ class GraphEditorView(context: Context) : View(context) {
         val b = p.keys[seg + 1]
         if (a.interp != Interp.BEZIER) return null
         val span = (b.time - a.time).toDouble()
-        val avg = segAvg(a, b)
+        val avg = segAvg(p, seg)
         if (abs(avg) < 1e-9 || span <= 0.0) return null
         val e = easeOf(a)
         val infOut = max(e[0], MIN_INFLUENCE)
@@ -370,11 +385,16 @@ class GraphEditorView(context: Context) : View(context) {
         }
 
         val seg = segIndex(p.keys)
+        if (pathMode && p.spatial) {
+            drawPathMode(canvas, p, seg, r)
+            drawModeChips(canvas, r, p)
+            return
+        }
         val presetSel = if (seg >= 0) p.keys[seg] else null
         for (i in PRESETS.indices) {
             val pr = PRESETS[i]
             var on = false
-            if (presetSel != null && presetSel.interp == pr.interp && pr.side != 3) {
+            if (presetSel != null && presetSel.interp == pr.interp && pr.side < 3) {
                 val e = easeOf(presetSel)
                 on = when (pr.side) {
                     1 -> abs(e[0] - pr.ease[0]) < 0.01 && abs(e[1] - pr.ease[1]) < 0.01
@@ -408,11 +428,13 @@ class GraphEditorView(context: Context) : View(context) {
         canvas.drawText(String.format(Locale.US, "%.0f", lo), 2f * density, r.bottom, textPaint)
         textPaint.color = Color.parseColor("#8A8FA0")
         textPaint.textSize = 10f * density
-        canvas.drawText(if (speedMode) "Speed graph (units/s)" else "Value graph", r.left + 6f * density, r.top + 12f * density, textPaint)
+        canvas.drawText(if (speedMode) "Speed (units/s)" else "Value", r.left + 6f * density, r.top + 12f * density, textPaint)
 
 
         canvas.save()
         canvas.clipRect(r)
+        if (showInOut) drawInOut(canvas, r, m)
+        if (showReference) drawReference(canvas, p, m, r)
         if (sm != null) {
             drawSpeedGraph(canvas, p, sm, r, seg)
         } else {
@@ -474,7 +496,7 @@ class GraphEditorView(context: Context) : View(context) {
             val b = p.keys[seg + 1]
             val d = referenceDim(a, b)
             val flat = if (speedMode) {
-                abs(segAvg(a, b)) < 1e-9
+                abs(segAvg(p, seg)) < 1e-9
             } else {
                 abs(b.value.getOrElse(d) { 0.0 } - a.value.getOrElse(d) { 0.0 }) < 1e-9
             }
@@ -488,10 +510,7 @@ class GraphEditorView(context: Context) : View(context) {
             canvas.drawText(msg, r.left + 8f * density, r.bottom - 8f * density, textPaint)
         }
 
-        // Value | Speed switch
-        drawChip(canvas, modeRect(0, r), if (fitSegment) "Fit seg" else "Fit all", fitSegment, true)
-        drawChip(canvas, modeRect(1, r), "Value", !speedMode, true)
-        drawChip(canvas, modeRect(2, r), "Speed", speedMode, true)
+        drawModeChips(canvas, r, p)
 
         // playhead
         val lt = layerTime
@@ -536,7 +555,7 @@ class GraphEditorView(context: Context) : View(context) {
         val a = p.keys[seg]
         val b = p.keys[seg + 1]
         val e = easeOf(a)
-        val avg = segAvg(a, b)
+        val avg = segAvg(p, seg)
         val infOut = max(e[0], MIN_INFLUENCE)
         val infIn = max(1.0 - e[2], MIN_INFLUENCE)
         val xa = xOf(sm, r, a.time)
@@ -567,12 +586,370 @@ class GraphEditorView(context: Context) : View(context) {
         textPaint.textAlign = Paint.Align.LEFT
     }
 
+    private fun isSpatial(path: String): Boolean = path == Path.POSITION || path == Path.ANCHOR
+
+    private fun applyAutoType() {
+        if (autoType) speedMode = isSpatial(selPath)
+        if (!isSpatial(selPath)) pathMode = false
+    }
+
+    // Graph type and options, like After Effects' menu
+    private fun showOptions() {
+        val items = arrayOf("Auto-Select Graph Type", "Show Reference Graph", "Show Layer In/Out Points")
+        val checked = booleanArrayOf(autoType, showReference, showInOut)
+        AlertDialog.Builder(context)
+            .setTitle("Graph options")
+            .setMultiChoiceItems(items, checked) { _, which, on ->
+                when (which) {
+                    0 -> {
+                        autoType = on
+                        applyAutoType()
+                    }
+                    1 -> showReference = on
+                    else -> showInOut = on
+                }
+                invalidate()
+            }
+            .setPositiveButton("Done", null)
+            .show()
+    }
+
+    // the other graph type in the background, for looking only
+    private fun drawReference(canvas: Canvas, p: Prop, m: Mapping, r: RectF) {
+        linePaint.color = Color.parseColor("#40FFFFFF")
+        linePaint.strokeWidth = 1.2f * density
+        if (speedMode) {
+            val first = max(p.keys.first().time, m.t0)
+            val last = min(p.keys.last().time, m.t1)
+            if (last <= first) return
+            val dims = p.keys.first().value.size
+            for (d in 0 until dims) {
+                var px = 0f
+                var py = 0f
+                for (i in 0..100) {
+                    val t = first + (last - first) * i / 100
+                    val x = xOf(m, r, t)
+                    val y = yOf(m, r, Eval.valueAt(p, t).getOrElse(d) { 0.0 })
+                    if (i > 0) canvas.drawLine(px, py, x, y, linePaint)
+                    px = x
+                    py = y
+                }
+            }
+        } else {
+            val sm = speedMapping(p, m)
+            for (s in 0 until p.keys.size - 1) {
+                val a = p.keys[s]
+                val b = p.keys[s + 1]
+                var px = 0f
+                var py = 0f
+                for (i in 0..40) {
+                    val t = a.time + (b.time - a.time) * i / 40
+                    val x = xOf(sm, r, t)
+                    val y = yOf(sm, r, speedAt(p, s, t))
+                    if (i > 0) canvas.drawLine(px, py, x, y, linePaint)
+                    px = x
+                    py = y
+                }
+            }
+        }
+    }
+
+    // the layer's In and Out points, shown as curly braces
+    private fun drawInOut(canvas: Canvas, r: RectF, m: Mapping) {
+        val l = layer ?: return
+        linePaint.color = Color.parseColor("#80FF9F43")
+        linePaint.strokeWidth = density
+        textPaint.color = Color.parseColor("#FF9F43")
+        textPaint.textSize = 12f * density
+        textPaint.textAlign = Paint.Align.CENTER
+        val marks = listOf(Pair(l.inPoint - l.startTime, "{"), Pair(l.outPoint - l.startTime, "}"))
+        for (mk in marks) {
+            if (mk.first < m.t0 || mk.first > m.t1) continue
+            val x = xOf(m, r, mk.first)
+            canvas.drawLine(x, r.top, x, r.bottom, linePaint)
+            canvas.drawText(mk.second, x, r.top + 14f * density, textPaint)
+        }
+        textPaint.textAlign = Paint.Align.LEFT
+    }
+
+    // ---------- motion path (Path mode) ----------
+
+    private class PathMap(val minX: Double, val minY: Double, val scale: Double, val ox: Float, val oy: Float)
+
+    private fun pathX(pm: PathMap, x: Double): Float = (pm.ox + (x - pm.minX) * pm.scale).toFloat()
+    private fun pathY(pm: PathMap, y: Double): Float = (pm.oy + (y - pm.minY) * pm.scale).toFloat()
+    private fun compX(pm: PathMap, px: Float): Double = (px - pm.ox) / pm.scale + pm.minX
+    private fun compY(pm: PathMap, py: Float): Double = (py - pm.oy) / pm.scale + pm.minY
+
+    private fun pathChip(i: Int): RectF = chipRect(i, PATH_CHIPS.size, height - chipH - 2f * density)
+
+    private fun tanLen(t: List<Double>): Double = sqrt(t[0] * t[0] + t[1] * t[1])
+
+    // a handle is shown unless the keyframe is Linear, or an Auto keyframe at the end of the path (no handle there)
+    private fun handleShown(k: Keyframe, t: List<Double>): Boolean =
+        k.pathType != PathType.LINEAR && (tanLen(t) > 1e-6 || k.pathType != PathType.AUTO)
+
+    // x and y of the whole path fitted into the plot, same scale in both directions
+    private fun pathMap(p: Prop, seg: Int, r: RectF): PathMap? {
+        val fp = frozenPath
+        if (fp != null) return fp
+        if (p.keys.size < 2) return null
+        var minX = Double.MAX_VALUE
+        var maxX = -Double.MAX_VALUE
+        var minY = Double.MAX_VALUE
+        var maxY = -Double.MAX_VALUE
+        fun add(x: Double, y: Double) {
+            minX = min(minX, x)
+            maxX = max(maxX, x)
+            minY = min(minY, y)
+            maxY = max(maxY, y)
+        }
+        for (k in p.keys) add(k.value[0], k.value[1])
+        val first = p.keys.first().time
+        val last = p.keys.last().time
+        for (i in 0..60) {
+            val v = Eval.valueAt(p, first + (last - first) * i / 60)
+            add(v[0], v[1])
+        }
+        if (seg >= 0) {
+            for (ki in intArrayOf(seg, seg + 1)) {
+                val k = p.keys[ki]
+                if (k.pathType == PathType.LINEAR) continue
+                val t = spatialTangents(p.keys, ki)
+                add(k.value[0] + t.first[0], k.value[1] + t.first[1])
+                add(k.value[0] + t.second[0], k.value[1] + t.second[1])
+            }
+        }
+        val pad = 22f * density
+        val rw = r.width() - 2 * pad
+        val rh = r.height() - 2 * pad
+        val bw = max(maxX - minX, 1.0)
+        val bh = max(maxY - minY, 1.0)
+        val scale = min(rw / bw, rh / bh)
+        val ox = r.left + pad + ((rw - bw * scale) / 2.0).toFloat()
+        val oy = r.top + pad + ((rh - bh * scale) / 2.0).toFloat()
+        return PathMap(minX, minY, scale, ox, oy)
+    }
+
+    private fun drawModeChips(canvas: Canvas, r: RectF, p: Prop?) {
+        drawChip(canvas, modeRect(0, r), if (fitSegment) "Fit seg" else "Fit all", fitSegment, !pathMode)
+        drawChip(canvas, modeRect(1, r), "Value", !speedMode && !pathMode, true)
+        drawChip(canvas, modeRect(2, r), "Speed", speedMode && !pathMode, true)
+        drawChip(canvas, modeRect(3, r), "Path", pathMode, p != null && p.spatial)
+        drawChip(canvas, modeRect(4, r), "Opts", false, true)
+    }
+
+    private fun drawPathMode(canvas: Canvas, p: Prop, seg: Int, r: RectF) {
+        // bottom chips: Linear, Auto, Continuous, Bezier for both keyframes of the segment
+        for (i in PATH_CHIPS.indices) {
+            val on = seg >= 0 && p.keys[seg].pathType == PATH_CHIPS[i].second && p.keys[seg + 1].pathType == PATH_CHIPS[i].second
+            drawChip(canvas, pathChip(i), PATH_CHIPS[i].first, on, seg >= 0)
+        }
+        fillPaint.color = Color.parseColor("#1B1B24")
+        canvas.drawRect(r, fillPaint)
+        linePaint.strokeWidth = density
+        linePaint.color = Color.parseColor("#33FFFFFF")
+        canvas.drawRect(r, linePaint)
+        textPaint.color = Color.parseColor("#8A8FA0")
+        textPaint.textSize = 10f * density
+        textPaint.textAlign = Paint.Align.LEFT
+        canvas.drawText("Motion path (x, y)", r.left + 6f * density, r.top + 12f * density, textPaint)
+        val pm = pathMap(p, seg, r) ?: return
+
+        canvas.save()
+        canvas.clipRect(r)
+        val first = p.keys.first().time
+        val last = p.keys.last().time
+
+        // the path
+        linePaint.color = Color.parseColor("#7DB7FF")
+        linePaint.strokeWidth = 1.8f * density
+        var px = 0f
+        var py = 0f
+        for (i in 0..200) {
+            val v = Eval.valueAt(p, first + (last - first) * i / 200)
+            val x = pathX(pm, v[0])
+            val y = pathY(pm, v[1])
+            if (i > 0) canvas.drawLine(px, py, x, y, linePaint)
+            px = x
+            py = y
+        }
+        // dots in time: close together = slow, far apart = fast
+        fillPaint.color = Color.parseColor("#99FFFFFF")
+        for (i in 0..80) {
+            val v = Eval.valueAt(p, first + (last - first) * i / 80)
+            canvas.drawCircle(pathX(pm, v[0]), pathY(pm, v[1]), 1.6f * density, fillPaint)
+        }
+
+        // handles of the two keyframes of the selected segment
+        if (seg >= 0) {
+            for (ki in intArrayOf(seg, seg + 1)) {
+                val k = p.keys[ki]
+                val t = spatialTangents(p.keys, ki)
+                val kx = pathX(pm, k.value[0])
+                val ky = pathY(pm, k.value[1])
+                for (isOut in booleanArrayOf(false, true)) {
+                    val v = if (isOut) t.second else t.first
+                    if (!handleShown(k, v)) continue
+                    val hx = pathX(pm, k.value[0] + v[0])
+                    val hy = pathY(pm, k.value[1] + v[1])
+                    linePaint.color = Color.parseColor("#FFD54A")
+                    linePaint.strokeWidth = 1.4f * density
+                    canvas.drawLine(kx, ky, hx, hy, linePaint)
+                    fillPaint.color = Color.parseColor("#FFD54A")
+                    canvas.drawCircle(hx, hy, 6f * density, fillPaint)
+                }
+            }
+        }
+
+        // keyframes (the selected segment's two are white)
+        for ((ki, k) in p.keys.withIndex()) {
+            val on = seg >= 0 && (ki == seg || ki == seg + 1)
+            fillPaint.color = if (on) Color.WHITE else Color.parseColor("#8A8FA0")
+            canvas.drawRect(
+                pathX(pm, k.value[0]) - 4.5f * density, pathY(pm, k.value[1]) - 4.5f * density,
+                pathX(pm, k.value[0]) + 4.5f * density, pathY(pm, k.value[1]) + 4.5f * density, fillPaint
+            )
+        }
+
+        // where the layer is now
+        val now = Eval.valueAt(p, layerTime)
+        fillPaint.color = Color.parseColor("#FF9F43")
+        canvas.drawCircle(pathX(pm, now[0]), pathY(pm, now[1]), 5f * density, fillPaint)
+        canvas.restore()
+
+        if (seg < 0) {
+            textPaint.color = Color.parseColor("#FFD54A")
+            textPaint.textSize = 10.5f * density
+            canvas.drawText("Tap a keyframe to select its segment", r.left + 8f * density, r.bottom - 8f * density, textPaint)
+        }
+    }
+
+    // what the finger is on in Path mode: a handle (target 8, targetIndex = key * 2 + 1 for the outgoing one)
+    // or a keyframe (target 7)
+    private fun hitPath(p: Prop, seg: Int, r: RectF, x: Float, y: Float) {
+        val pm = pathMap(p, seg, r) ?: return
+        if (seg >= 0) {
+            var best = Float.MAX_VALUE
+            var bestId = -1
+            for (ki in intArrayOf(seg, seg + 1)) {
+                val k = p.keys[ki]
+                val t = spatialTangents(p.keys, ki)
+                for (isOut in booleanArrayOf(false, true)) {
+                    val v = if (isOut) t.second else t.first
+                    if (!handleShown(k, v)) continue
+                    val d = abs(x - pathX(pm, k.value[0] + v[0])) + abs(y - pathY(pm, k.value[1] + v[1]))
+                    if (d < best) {
+                        best = d
+                        bestId = ki * 2 + (if (isOut) 1 else 0)
+                    }
+                }
+            }
+            if (bestId >= 0 && best <= 26f * density) {
+                target = 8
+                targetIndex = bestId
+                return
+            }
+        }
+        var best = Float.MAX_VALUE
+        var bestKey = -1
+        for ((ki, k) in p.keys.withIndex()) {
+            val d = abs(x - pathX(pm, k.value[0])) + abs(y - pathY(pm, k.value[1]))
+            if (d < best) {
+                best = d
+                bestKey = ki
+            }
+        }
+        if (bestKey >= 0 && best <= 26f * density) {
+            target = 7
+            targetIndex = bestKey
+            keyDim = -1
+        }
+    }
+
+    // dragging a handle: its position on screen becomes an offset from the keyframe
+    private fun dragTangent(p: Prop, x: Float, y: Float) {
+        val pm = pathMap(p, segIndex(p.keys), plotRect()) ?: return
+        val ki = targetIndex / 2
+        val k = p.keys.getOrNull(ki) ?: return
+        val vec = MutableList(k.value.size) { 0.0 }
+        vec[0] = compX(pm, x) - k.value[0]
+        vec[1] = compY(pm, y) - k.value[1]
+        onTangent?.invoke(selPath, ki, targetIndex % 2 == 1, vec)
+    }
+
+    // dragging a keyframe on the path: moves it in x and y, its time stays
+    private fun dragPathKey(p: Prop, x: Float, y: Float) {
+        val pm = pathMap(p, segIndex(p.keys), plotRect()) ?: return
+        val k = p.keys.getOrNull(targetIndex) ?: return
+        val v = k.value.toMutableList()
+        v[0] = compX(pm, x)
+        v[1] = compY(pm, y)
+        onKeyMove?.invoke(selPath, targetIndex, k.time, v)
+    }
+
+    // dragging a keyframe in the value graph: sideways = time, up and down = value of the curve you grabbed
+    private fun dragKey(p: Prop, x: Float, y: Float) {
+        val m = mapping(p) ?: return
+        val r = plotRect()
+        val k = p.keys.getOrNull(targetIndex) ?: return
+        val t = Math.round(timeAt(m, r, x))
+        val v = k.value.toMutableList()
+        if (keyDim in v.indices) v[keyDim] = valueAtY(m, r, y)
+        onKeyMove?.invoke(selPath, targetIndex, t, v)
+    }
+
+    // Bounce: adds keyframes so the value falls to the end value and bounces until it settles
+    private fun showBounceDialog(p: Prop, seg: Int) {
+        val a = p.keys[seg]
+        val b = p.keys[seg + 1]
+        if (abs(segAvg(p, seg)) < 1e-9) {
+            AlertDialog.Builder(context)
+                .setTitle("Bounce")
+                .setMessage("Both keyframes have the same value, so there is nothing to bounce.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        val bounces = EditText(context).apply {
+            setText("3")
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val bouncy = EditText(context).apply {
+            setText("40")
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        fun row(label: String, f: View): LinearLayout = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(TextView(context).apply { text = label }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(f, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        val pad = (20 * density).toInt()
+        val form = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, 0)
+            addView(TextView(context).apply { text = "Adds keyframes between these two keyframes. The value reaches the end value, bounces back towards the start value and settles." })
+            addView(row("Bounces (1 to 8)", bounces))
+            addView(row("Bounciness (10 to 90 %)", bouncy))
+        }
+        AlertDialog.Builder(context)
+            .setTitle("Bounce")
+            .setView(form)
+            .setPositiveButton("Add bounce") { _, _ ->
+                val n = bounces.text.toString().toIntOrNull()
+                val pct = bouncy.text.toString().toDoubleOrNull()
+                if (n != null && pct != null) onBounce?.invoke(selPath, seg, n, pct / 100.0)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     // Keyframe Velocity: speed and influence, typed in. Out = leaving the start keyframe,
     // In = arriving at the end keyframe (same numbers the speed graph handles show).
     private fun showVelocityDialog(p: Prop, seg: Int) {
         val a = p.keys[seg]
         val b = p.keys[seg + 1]
-        val avg = segAvg(a, b)
+        val avg = segAvg(p, seg)
         if (abs(avg) < 1e-9) {
             AlertDialog.Builder(context)
                 .setTitle("Keyframe Velocity")
@@ -593,16 +970,27 @@ class GraphEditorView(context: Context) : View(context) {
         val inflOut = field(infOut * 100)
         val speedIn = field(avg * (1.0 - e[3]) / infIn)
         val inflIn = field(infIn * 100)
-        fun row(label: String, f: EditText): LinearLayout = LinearLayout(context).apply {
+        fun row(label: String, f: View): LinearLayout = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(TextView(context).apply { text = label }, LinearLayout.LayoutParams(0, -2, 1f))
             addView(f, LinearLayout.LayoutParams(0, -2, 1f))
         }
+        val typeNames = arrayOf("Bezier", "Auto Bezier", "Continuous Bezier")
+        fun typeSpinner(sel: Smooth): Spinner = Spinner(context).apply {
+            adapter = ArrayAdapter(context, android.R.layout.simple_spinner_dropdown_item, typeNames)
+            setSelection(SMOOTHS.indexOf(sel))
+        }
+        val startType = typeSpinner(a.smooth)
+        val endType = typeSpinner(b.smooth)
+        val initial = listOf(speedOut, inflOut, speedIn, inflIn).map { it.text.toString() }
         val pad = (20 * density).toInt()
         val form = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad / 2, pad, 0)
-            addView(TextView(context).apply { text = "Outgoing (start keyframe)" })
+            addView(TextView(context).apply { text = "Keyframe type" })
+            addView(row("Start keyframe", startType))
+            addView(row("End keyframe", endType))
+            addView(TextView(context).apply { text = "Outgoing (start keyframe)"; setPadding(0, pad / 2, 0, 0) })
             addView(row("Speed (units/s)", speedOut))
             addView(row("Influence (%)", inflOut))
             addView(TextView(context).apply { text = "Incoming (end keyframe)"; setPadding(0, pad / 2, 0, 0) })
@@ -613,11 +1001,17 @@ class GraphEditorView(context: Context) : View(context) {
             .setTitle("Keyframe Velocity")
             .setView(form)
             .setPositiveButton("Apply") { _, _ ->
+                val startSm = SMOOTHS[startType.selectedItemPosition]
+                val endSm = SMOOTHS[endType.selectedItemPosition]
+                if (startSm != a.smooth) onSmooth?.invoke(selPath, seg, startSm)
+                if (endSm != b.smooth) onSmooth?.invoke(selPath, seg + 1, endSm)
+                // typed numbers win over the automatic handles
+                val now = listOf(speedOut, inflOut, speedIn, inflIn).map { it.text.toString() }
                 val so = speedOut.text.toString().toDoubleOrNull()
                 val io = inflOut.text.toString().toDoubleOrNull()
                 val si = speedIn.text.toString().toDoubleOrNull()
                 val ii = inflIn.text.toString().toDoubleOrNull()
-                if (so != null && io != null && si != null && ii != null) {
+                if (now != initial && so != null && io != null && si != null && ii != null) {
                     val fo = (io / 100.0).coerceIn(MIN_INFLUENCE, 1.0)
                     val fi = (ii / 100.0).coerceIn(MIN_INFLUENCE, 1.0)
                     val lo = if (signed) -1.0 else 0.0
@@ -655,20 +1049,34 @@ class GraphEditorView(context: Context) : View(context) {
         val p = currentProp() ?: return
         val m = mapping(p) ?: return
         val seg = segIndex(p.keys)
-        for (i in PRESETS.indices) {
-            if (bottomChip(i).contains(x, y)) {
-                target = 2
-                targetIndex = i
-                return
+        if (pathMode && p.spatial) {
+            for (i in PATH_CHIPS.indices) {
+                if (pathChip(i).contains(x, y)) {
+                    target = 9
+                    targetIndex = i
+                    return
+                }
+            }
+        } else {
+            for (i in PRESETS.indices) {
+                if (bottomChip(i).contains(x, y)) {
+                    target = 2
+                    targetIndex = i
+                    return
+                }
             }
         }
         val r = plotRect()
-        for (i in 0..2) {
+        for (i in 0..4) {
             if (modeRect(i, r).contains(x, y)) {
                 target = 6
                 targetIndex = i
                 return
             }
+        }
+        if (pathMode && p.spatial) {
+            hitPath(p, seg, r, x, y)
+            return
         }
         if (seg >= 0) {
             val h = activeHandles(p, seg, m, r)
@@ -686,6 +1094,28 @@ class GraphEditorView(context: Context) : View(context) {
                 }
             }
         }
+        if (!speedMode) {
+            var best = Float.MAX_VALUE
+            var bestKey = -1
+            var bestDim = 0
+            for ((ki, k) in p.keys.withIndex()) {
+                val kx = xOf(m, r, k.time)
+                for (d in k.value.indices) {
+                    val dist = abs(x - kx) + abs(y - yOf(m, r, k.value[d]))
+                    if (dist < best) {
+                        best = dist
+                        bestKey = ki
+                        bestDim = d
+                    }
+                }
+            }
+            if (bestKey >= 0 && best <= 26f * density) {
+                target = 7
+                targetIndex = bestKey
+                keyDim = bestDim
+                return
+            }
+        }
         if (r.contains(x, y)) target = 5
         if (l.id < 0L) target = 0
     }
@@ -699,19 +1129,28 @@ class GraphEditorView(context: Context) : View(context) {
                 hitTest(e.x, e.y)
             }
             MotionEvent.ACTION_MOVE -> {
-                if (target == 3 || target == 4) {
+                if (target == 3 || target == 4 || target == 7 || target == 8) {
                     val p = currentProp()
                     if (p != null) {
                         val moved = abs(e.x - downX) > slop || abs(e.y - downY) > slop
                         if (!dragging && moved) {
                             dragging = true
+                            if (target == 7 && !pathMode) frozenValue = mapping(p)
+                            if (pathMode && (target == 7 || target == 8)) frozenPath = pathMap(p, segIndex(p.keys), plotRect())
                             if (speedMode) {
                                 val m = mapping(p)
                                 if (m != null) frozenMap = speedMapping(p, m)
                             }
                             onEaseStart?.invoke()
                         }
-                        if (dragging) dragHandle(p, e.x, e.y)
+                        if (dragging) {
+                            when {
+                                target == 8 -> dragTangent(p, e.x, e.y)
+                                target == 7 && pathMode -> dragPathKey(p, e.x, e.y)
+                                target == 7 -> dragKey(p, e.x, e.y)
+                                else -> dragHandle(p, e.x, e.y)
+                            }
+                        }
                     }
                 }
             }
@@ -724,6 +1163,8 @@ class GraphEditorView(context: Context) : View(context) {
                 }
                 dragging = false
                 frozenMap = null
+                frozenValue = null
+                frozenPath = null
                 target = 0
                 invalidate()
             }
@@ -731,6 +1172,8 @@ class GraphEditorView(context: Context) : View(context) {
                 if (dragging) onEaseEnd?.invoke()
                 dragging = false
                 frozenMap = null
+                frozenValue = null
+                frozenPath = null
                 target = 0
             }
         }
@@ -743,6 +1186,7 @@ class GraphEditorView(context: Context) : View(context) {
                 selPath = PATHS[targetIndex]
                 userSeg = -1
                 userChose = true
+                applyAutoType()
                 invalidate()
             }
             2 -> {
@@ -754,6 +1198,10 @@ class GraphEditorView(context: Context) : View(context) {
                     showVelocityDialog(p, seg)
                     return
                 }
+                if (pr.side == 4) {
+                    showBounceDialog(p, seg)
+                    return
+                }
                 // a segment that is not Bezier yet starts from the Bezier that looks the same as Linear
                 val cur = if (p.keys[seg].interp == Interp.BEZIER) easeOf(p.keys[seg]) else listOf(0.3333, 0.3333, 0.6667, 0.6667)
                 val next = when (pr.side) {
@@ -763,11 +1211,38 @@ class GraphEditorView(context: Context) : View(context) {
                 }
                 onPreset?.invoke(selPath, seg, pr.interp, next)
             }
+            9 -> {
+                val cp = currentProp() ?: return
+                val sg = segIndex(cp.keys)
+                if (sg >= 0) onPathType?.invoke(selPath, sg, PATH_CHIPS[targetIndex].second)
+            }
+            7 -> {
+                if (pathMode) {
+                    val cp = currentProp() ?: return
+                    if (cp.keys.size >= 2) {
+                        userSeg = min(targetIndex, cp.keys.size - 2)
+                        invalidate()
+                    }
+                }
+            }
             6 -> {
                 when (targetIndex) {
                     0 -> fitSegment = !fitSegment
-                    1 -> speedMode = false
-                    else -> speedMode = true
+                    1 -> {
+                        speedMode = false
+                        pathMode = false
+                        autoType = false
+                    }
+                    2 -> {
+                        speedMode = true
+                        pathMode = false
+                        autoType = false
+                    }
+                    3 -> {
+                        val cp = currentProp()
+                        if (cp != null && cp.spatial) pathMode = true
+                    }
+                    else -> showOptions()
                 }
                 invalidate()
             }
@@ -820,7 +1295,7 @@ class GraphEditorView(context: Context) : View(context) {
         val a = p.keys[seg]
         val b = p.keys[seg + 1]
         val span = (b.time - a.time).toDouble()
-        val avg = segAvg(a, b)
+        val avg = segAvg(p, seg)
         if (abs(avg) < 1e-9 || span <= 0.0) return
         val r = plotRect()
         val sm = speedMapping(p, m)
