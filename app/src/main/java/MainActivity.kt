@@ -135,7 +135,16 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             setPadding(dp(12), dp(8), dp(12), dp(2))
         }
-        compView = CompGLView(this)
+        compView = CompGLView(this).apply {
+            // dragging the motion path on the preview: no undo step until you let go
+            onPathEditStart = {
+                stopPlay()
+                session.beginGroup()
+            }
+            onPathKey = { idx, x, y -> moveKeyOnPath(idx, x, y) }
+            onPathTangent = { idx, isOut, vec -> moveTangentLive(Path.POSITION, idx, isOut, vec) }
+            onPathEditEnd = { endScrub() }
+        }
         timeLabel = TextView(this).apply {
             setTextColor(Color.parseColor("#4DA3FF"))
             typeface = Typeface.MONOSPACE
@@ -179,7 +188,6 @@ class MainActivity : Activity() {
             onPreset = { path, idx, interp, ease -> applyPreset(path, idx, interp, ease) }
             onKeyMove = { path, idx, t, v -> moveKeyLive(path, idx, t, v) }
             onSmooth = { path, idx, sm -> applySmooth(path, idx, sm) }
-            onBounce = { path, idx, n, bounciness -> applyBounce(path, idx, n, bounciness) }
             onTangent = { path, idx, isOut, vec -> moveTangentLive(path, idx, isOut, vec) }
             onPathType = { path, seg, type -> applyPathType(path, seg, type) }
         }
@@ -868,23 +876,24 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    // dragging a Position keyframe on the preview: x and y change, its time stays
+    private fun moveKeyOnPath(idx: Int, x: Double, y: Double) {
+        val sel = selectedPair() ?: return
+        val pr = sel.second.props[Path.POSITION] ?: return
+        val k = pr.keys.getOrNull(idx) ?: return
+        val v = k.value.toMutableList()
+        if (v.size < 2) return
+        v[0] = x
+        v[1] = y
+        moveKeyLive(Path.POSITION, idx, k.time, v)
+    }
+
     private fun applySmooth(path: String, idx: Int, smooth: Smooth) {
         val sel = selectedPair() ?: return
         val c = sel.first
         val l = sel.second
         session.edit { p ->
             p.withLayerProp(c.id, l.id, path) { pr -> withKeySmooth(pr, idx, smooth) }
-        }
-        refresh()
-    }
-
-    private fun applyBounce(path: String, idx: Int, bounces: Int, bounciness: Double) {
-        val sel = selectedPair() ?: return
-        val c = sel.first
-        val l = sel.second
-        val tpf = c.frameRate.ticksPerFrame
-        session.edit { p ->
-            p.withLayerProp(c.id, l.id, path) { pr -> withBounce(pr, idx, bounces, bounciness, tpf) }
         }
         refresh()
     }

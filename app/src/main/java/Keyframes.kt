@@ -261,56 +261,6 @@ fun moveKey(prop: Prop, index: Int, newTime: Long, newValue: List<Double>, minGa
     return smoothen(prop.copy(keys = keys))
 }
 
-// Bounce: replaces the segment that starts at keyframe `index` with a ball-drop. The value falls to the
-// end value, then bounces back towards the start value and settles, `bounces` times. Each bounce is
-// `bounciness` (0.1 to 0.9) of the height of the one before, and takes less time (free fall: time ~ sqrt(height)).
-// It adds real keyframes (on whole frames, tpf ticks), so you can still edit them in the graph.
-fun withBounce(prop: Prop, index: Int, bounces: Int, bounciness: Double, tpf: Long): Prop {
-    if (index < 0 || index + 1 >= prop.keys.size || tpf <= 0L) return prop
-    val n = bounces.coerceIn(1, 8)
-    val q = bounciness.coerceIn(0.1, 0.9)
-    val a = prop.keys[index]
-    val b = prop.keys[index + 1]
-    val span = (b.time - a.time).toDouble()
-    if (span <= 0.0 || abs(segDelta(a, b)) < 1e-12) return prop
-
-    var total = 1.0
-    for (i in 1..n) total += 2.0 * Math.pow(q, i / 2.0)
-    val unit = span / total
-
-    // speeding up (value ~ t squared) and slowing down, as exact cubic beziers
-    val fall = listOf(1.0 / 3.0, 0.0, 2.0 / 3.0, 1.0 / 3.0)
-    val rise = listOf(1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 1.0)
-
-    class Hit(val rel: Double, val value: List<Double>, val ease: List<Double>)
-    val hits = ArrayList<Hit>()
-    var cursor = unit
-    hits.add(Hit(cursor, b.value, rise)) // first time it reaches the end value
-    for (i in 1..n) {
-        val half = unit * Math.pow(q, i / 2.0)
-        val h = Math.pow(q, i.toDouble())
-        val peak = b.value.indices.map { d ->
-            val from = a.value.getOrElse(d) { b.value[d] }
-            b.value[d] + (from - b.value[d]) * h
-        }
-        hits.add(Hit(cursor + half, peak, fall))
-        cursor += 2.0 * half
-        if (i < n) hits.add(Hit(cursor, b.value, rise)) // the last one is the end keyframe itself
-    }
-
-    val made = ArrayList<Keyframe>()
-    var lastTime = a.time
-    for (h in hits) {
-        val t = a.time + Math.round(h.rel / tpf) * tpf
-        if (t <= lastTime || t >= b.time) continue
-        made.add(Keyframe(t, h.value, Interp.BEZIER, h.ease))
-        lastTime = t
-    }
-    val first = a.copy(interp = Interp.BEZIER, ease = fall, smooth = Smooth.NONE)
-    val last = if (b.smooth == Smooth.NONE) b else b.copy(smooth = Smooth.NONE)
-    return prop.copy(keys = prop.keys.take(index) + first + made + last + prop.keys.drop(index + 2))
-}
-
 // ---------- motion path (spatial interpolation) ----------
 // Position and Anchor (Prop.spatial) move along a curve between keyframes, like After Effects.
 // The curve is a cubic bezier: start = this keyframe, handle = outTan, handle = next keyframe's inTan,
@@ -325,27 +275,28 @@ private fun norm(v: List<Double>): Double {
     return sqrt(s)
 }
 
-// Auto Bezier: the path flows through the keyframe, handles 1/3 of the way to each neighbour.
+// Auto Bezier tangents, the rule EffectCraft measured against After Effects 26.3 (a Catmull-Rom spline):
+//  middle key: out = (next - previous) / 6, in = the mirror of it
+//  end keys:   (neighbour - key) / 6, mirrored the same way
+//  key times play no part
 private fun autoTangents(keys: List<Keyframe>, i: Int): Pair<List<Double>, List<Double>> {
     val c = keys[i].value
     val n = c.size
-    if (i == 0 || i == keys.size - 1) return Pair(zeros(n), zeros(n))
-    val p = keys[i - 1].value
-    val nx = keys[i + 1].value
-    val dir = List(n) { nx.getOrElse(it) { c[it] } - p.getOrElse(it) { c[it] } }
-    val len = norm(dir)
-    if (len < 1e-9) return Pair(zeros(n), zeros(n))
-    val dIn = norm(List(n) { c[it] - p.getOrElse(it) { c[it] } })
-    val dOut = norm(List(n) { nx.getOrElse(it) { c[it] } - c[it] })
-    return Pair(List(n) { -dir[it] / len * dIn / 3.0 }, List(n) { dir[it] / len * dOut / 3.0 })
+    if (keys.size < 2) return Pair(zeros(n), zeros(n))
+    val out = when (i) {
+        0 -> List(n) { (keys[1].value.getOrElse(it) { c[it] } - c[it]) / 6.0 }
+        keys.size - 1 -> List(n) { (c[it] - keys[i - 1].value.getOrElse(it) { c[it] }) / 6.0 }
+        else -> List(n) { (keys[i + 1].value.getOrElse(it) { c[it] } - keys[i - 1].value.getOrElse(it) { c[it] }) / 6.0 }
+    }
+    return Pair(out.map { -it }, out)
 }
 
-// Handles for a keyframe that has none yet: auto handles, or at the ends a handle 1/3 of the way
-// along the straight line (the path stays straight until you move it).
+// Handles for a keyframe that is turned into Bezier or Continuous: an Auto keyframe keeps the handles it
+// has now; a Linear one gets handles a third of the way along the straight line to each neighbour.
 private fun startTangents(keys: List<Keyframe>, i: Int): Pair<List<Double>, List<Double>> {
     val c = keys[i].value
     val n = c.size
-    if (i > 0 && i < keys.size - 1) {
+    if (keys[i].pathType != PathType.LINEAR) {
         val auto = autoTangents(keys, i)
         if (norm(auto.first) + norm(auto.second) > 1e-9) return auto
     }
@@ -369,6 +320,15 @@ fun spatialTangents(keys: List<Keyframe>, i: Int): Pair<List<Double>, List<Doubl
 }
 
 private const val CURVE_STEPS = 48
+
+// true when handle h lies on the segment's straight line, pointing the right way and not longer than it
+private fun onChord(h: List<Double>, chord: List<Double>, clen: Double, sign: Double): Boolean {
+    val hl = norm(h)
+    if (hl < 1e-9) return true
+    var dot = 0.0
+    for (d in h.indices) dot += h[d] * chord[d]
+    return sign * dot / (hl * clen) > 1.0 - 1e-9 && hl <= clen + 1e-9
+}
 
 private class SegCurve(
     val p0: List<Double>,
@@ -396,8 +356,13 @@ private fun segCurve(keys: List<Keyframe>, i: Int): SegCurve? {
     if (n < 2) return null
     val outA = spatialTangents(keys, i).second
     val inB = spatialTangents(keys, i + 1).first
-    if (norm(outA) < 1e-9 && norm(inB) < 1e-9) return null
     val p3 = List(n) { b.value.getOrElse(it) { a.value[it] } }
+    val chord = List(n) { p3[it] - a.value[it] }
+    val clen = norm(chord)
+    // the same point twice: no motion, the layer holds (EffectCraft does this too)
+    if (clen < 1e-9) return null
+    // both handles on the straight line: it IS the straight line, so interpolate it exactly
+    if (onChord(outA, chord, clen, 1.0) && onChord(inB, chord, clen, -1.0)) return null
     val p1 = List(n) { a.value[it] + outA[it] }
     val p2 = List(n) { p3[it] + inB.getOrElse(it) { 0.0 } }
     val c = SegCurve(a.value, p1, p2, p3, DoubleArray(CURVE_STEPS + 1))
@@ -614,7 +579,7 @@ object KeyframeTest {
             spatial = true
         )
         val mid = Eval.valueAt(curved, sec / 2)
-        check("auto motion path bends away from the straight line", Math.abs(mid[0] - 50.0) > 5.0)
+        check("auto motion path bends away from the straight line", Math.abs(mid[0] - 50.0) > 3.0)
         val flat = withSegmentPathType(curved, 0, PathType.LINEAR)
         val flatMid = Eval.valueAt(flat, sec / 2)
         check("linear motion path is a straight line", nearD(flatMid[0], 50.0) && nearD(flatMid[1], 50.0))
@@ -628,6 +593,23 @@ object KeyframeTest {
         val d12 = dist(q1, q2)
         val d23 = dist(q2, q3)
         check("speed along the path is even with linear timing", Math.abs(d12 - d23) < 0.05 * d12)
+        val aeMid = spatialTangents(curved.keys, 1)
+        check("auto handle of a middle key is (next - previous) / 6, as measured in After Effects", nearD(aeMid.second[0], 200.0 / 6.0) && nearD(aeMid.second[1], 0.0) && nearD(aeMid.first[0], -200.0 / 6.0))
+        val aeEnd = spatialTangents(curved.keys, 0)
+        check("an end key has a handle too: (neighbour - key) / 6", nearD(aeEnd.second[0], 100.0 / 6.0) && nearD(aeEnd.second[1], 100.0 / 6.0))
+        val twoKeys = Prop(listOf(0.0, 0.0), listOf(Keyframe(0L, listOf(0.0, 0.0)), Keyframe(sec, listOf(80.0, 40.0))), spatial = true)
+        check("a straight two-key move is exactly the straight line", Eval.valueAt(twoKeys, sec / 2) == listOf(40.0, 20.0))
+        val same = Prop(
+            listOf(0.0, 0.0),
+            listOf(
+                Keyframe(0L, listOf(0.0, 0.0)),
+                Keyframe(sec, listOf(100.0, 100.0)),
+                Keyframe(sec * 2, listOf(100.0, 100.0)),
+                Keyframe(sec * 3, listOf(200.0, 0.0))
+            ),
+            spatial = true
+        )
+        check("two identical keys hold still", nearD(Eval.valueAt(same, sec * 3 / 2)[0], 100.0) && nearD(Eval.valueAt(same, sec * 3 / 2)[1], 100.0))
         val tan = withKeyTangent(curved, 1, true, listOf(60.0, -20.0))
         check("pulling an auto handle makes it continuous", tan.keys[1].pathType == PathType.CONTINUOUS)
         val tin = tan.keys[1].inTan
@@ -731,19 +713,10 @@ object GraphTest {
         check("continuous keeps its smooth speed when the value changes", nearD(perSec(keySpeedIn(moved, 1)), perSec(keySpeedOut(moved, 1))))
         val plain = withKeySmooth(auto, 1, Smooth.NONE)
         check("back to plain bezier keeps the handles", plain.keys[1].smooth == Smooth.NONE && plain.keys[0].ease == auto.keys[0].ease)
-        // moving keyframes and bounce
+        // moving keyframes
         val mv = moveKey(three, 1, sec * 5, listOf(70.0), sec / 30)
         check("a moved keyframe stays before the next one", mv.keys[1].time == sec * 2 - sec / 30 && mv.keys[1].value == listOf(70.0))
         check("a moved keyframe stays after the previous one", moveKey(three, 1, -sec, listOf(5.0), sec / 30).keys[1].time == sec / 30)
-        val drop = Prop(listOf(0.0), listOf(Keyframe(0L, listOf(100.0)), Keyframe(sec * 2, listOf(0.0))))
-        val tpfB = sec / 30
-        val bounce = withBounce(drop, 0, 3, 0.4, tpfB)
-        check("bounce adds keyframes", bounce.keys.size == 2 * 3 + 2)
-        check("bounce starts and ends on the right values", nearD(Eval.valueAt(bounce, 0L)[0], 100.0) && nearD(Eval.valueAt(bounce, sec * 2)[0], 0.0))
-        check("bounce keys are in order and on whole frames", bounce.keys.zipWithNext().all { it.first.time < it.second.time } && bounce.keys.all { it.time % tpfB == 0L })
-        check("the first peak is 40% of the way back up", bounce.keys.drop(2).first().value[0] > 30.0 && bounce.keys.drop(2).first().value[0] < 50.0)
-        check("bounce never goes below the end value", (0..60).all { Eval.valueAt(bounce, sec * 2 * it / 60)[0] > -0.5 })
-        check("bounce does nothing when both values are the same", withBounce(Prop(listOf(0.0), listOf(Keyframe(0L, listOf(5.0)), Keyframe(sec, listOf(5.0)))), 0, 3, 0.4, tpfB).keys.size == 2)
         val fromLinear = withKeySmooth(
             Prop(listOf(0.0), listOf(Keyframe(0L, listOf(0.0)), Keyframe(sec, listOf(50.0)), Keyframe(sec * 2, listOf(200.0)))),
             1, Smooth.AUTO

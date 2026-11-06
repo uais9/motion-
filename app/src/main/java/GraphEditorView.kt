@@ -35,7 +35,7 @@ import kotlin.math.sqrt
 class GraphEditorView(context: Context) : View(context) {
 
     // side: 0 = whole segment, 1 = only the start handle (ease out), 2 = only the end handle (ease in),
-    // 3 = not a preset, opens the numbers dialog, 4 = not a preset, opens the bounce dialog
+    // 3 = not a preset, opens the numbers dialog
     private class Preset(val label: String, val interp: Interp, val ease: List<Double>, val side: Int = 0)
 
     private class Mapping(val t0: Long, val t1: Long, val vmin: Double, val vmax: Double)
@@ -49,8 +49,7 @@ class GraphEditorView(context: Context) : View(context) {
             Preset("Ease In", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 2),
             Preset("Ease Out", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 1),
             Preset("Hold", Interp.HOLD, listOf(0.33, 0.0, 0.67, 1.0)),
-            Preset("Numbers", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 3),
-            Preset("Bounce", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 4)
+            Preset("Numbers", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 3)
         )
         private val DEFAULT_EASE = listOf(0.33, 0.0, 0.67, 1.0)
         // Keyframe.time is in ticks (see TICKS_PER_SECOND), so speeds come out in units per second
@@ -68,7 +67,6 @@ class GraphEditorView(context: Context) : View(context) {
     var onPreset: ((String, Int, Interp, List<Double>) -> Unit)? = null
     var onKeyMove: ((String, Int, Long, List<Double>) -> Unit)? = null // path, key index, layer time, value
     var onSmooth: ((String, Int, Smooth) -> Unit)? = null // path, key index, type
-    var onBounce: ((String, Int, Int, Double) -> Unit)? = null // path, segment index, bounces, bounciness
     var onTangent: ((String, Int, Boolean, List<Double>) -> Unit)? = null // path, key index, true = outgoing handle, offset from the keyframe
     var onPathType: ((String, Int, PathType) -> Unit)? = null // path, segment index (both keyframes), type
 
@@ -899,51 +897,6 @@ class GraphEditorView(context: Context) : View(context) {
         onKeyMove?.invoke(selPath, targetIndex, t, v)
     }
 
-    // Bounce: adds keyframes so the value falls to the end value and bounces until it settles
-    private fun showBounceDialog(p: Prop, seg: Int) {
-        val a = p.keys[seg]
-        val b = p.keys[seg + 1]
-        if (abs(segAvg(p, seg)) < 1e-9) {
-            AlertDialog.Builder(context)
-                .setTitle("Bounce")
-                .setMessage("Both keyframes have the same value, so there is nothing to bounce.")
-                .setPositiveButton("OK", null)
-                .show()
-            return
-        }
-        val bounces = EditText(context).apply {
-            setText("3")
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        val bouncy = EditText(context).apply {
-            setText("40")
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        fun row(label: String, f: View): LinearLayout = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(TextView(context).apply { text = label }, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(f, LinearLayout.LayoutParams(0, -2, 1f))
-        }
-        val pad = (20 * density).toInt()
-        val form = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad / 2, pad, 0)
-            addView(TextView(context).apply { text = "Adds keyframes between these two keyframes. The value reaches the end value, bounces back towards the start value and settles." })
-            addView(row("Bounces (1 to 8)", bounces))
-            addView(row("Bounciness (10 to 90 %)", bouncy))
-        }
-        AlertDialog.Builder(context)
-            .setTitle("Bounce")
-            .setView(form)
-            .setPositiveButton("Add bounce") { _, _ ->
-                val n = bounces.text.toString().toIntOrNull()
-                val pct = bouncy.text.toString().toDoubleOrNull()
-                if (n != null && pct != null) onBounce?.invoke(selPath, seg, n, pct / 100.0)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
     // Keyframe Velocity: speed and influence, typed in. Out = leaving the start keyframe,
     // In = arriving at the end keyframe (same numbers the speed graph handles show).
     private fun showVelocityDialog(p: Prop, seg: Int) {
@@ -1196,10 +1149,6 @@ class GraphEditorView(context: Context) : View(context) {
                 val pr = PRESETS[targetIndex]
                 if (pr.side == 3) {
                     showVelocityDialog(p, seg)
-                    return
-                }
-                if (pr.side == 4) {
-                    showBounceDialog(p, seg)
                     return
                 }
                 // a segment that is not Bezier yet starts from the Bezier that looks the same as Linear
