@@ -43,6 +43,12 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
     var onPathTangent: ((Int, Boolean, List<Double>) -> Unit)? = null // key index, outgoing handle?, offset from the keyframe
     var onPathEditEnd: (() -> Unit)? = null
 
+    // Motion Sketch: while sketchMode is on, a finger drag on the preview draws a motion path (composition pixels)
+    var sketchMode = false
+    var onSketchStart: ((Double, Double) -> Unit)? = null
+    var onSketchPoint: ((Double, Double) -> Unit)? = null
+    var onSketchEnd: (() -> Unit)? = null
+
     private class Slot {
         @Volatile var surface: Surface? = null
         var texId = 0
@@ -325,6 +331,22 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
     private var downY = 0f
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (sketchMode) {
+            val sc = scene
+            if (sc == null || width <= 1) return true
+            val f = fit(sc.compW, sc.compH)
+            val cx = ((e.x - f[1]) / f[0]).toDouble()
+            val cy = ((e.y - f[2]) / f[0]).toDouble()
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    onSketchStart?.invoke(cx, cy)
+                }
+                MotionEvent.ACTION_MOVE -> onSketchPoint?.invoke(cx, cy)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onSketchEnd?.invoke()
+            }
+            return true
+        }
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 dragKey = -1
