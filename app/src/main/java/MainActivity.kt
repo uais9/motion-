@@ -41,6 +41,9 @@ class MainActivity : Activity() {
     private var graphMode = false
     // views that are hidden on the graph screen, so the graph can be big
     private var chromeViews: List<View> = emptyList()
+    // keyframes selected on the timeline (layer times) and the copied ones, by property
+    private var selectedKeys: Set<Long> = emptySet()
+    private var keyClip: Map<String, List<Keyframe>> = emptyMap()
     private lateinit var playBtn: Button
     private lateinit var loopBtn: Button
     private lateinit var exporter: Exporter
@@ -156,6 +159,8 @@ class MainActivity : Activity() {
             onSelect = { id -> selectLayer(id) }
             onMove = { id, delta, row -> moveLayer(id, delta, row) }
             onTrim = { id, edge, target -> trimLayer(id, edge, target) }
+            onKeySelect = { t, toggle -> selectKey(t, toggle) }
+            onKeysMove = { d -> moveSelectedKeys(d) }
         }
         panel = PropertyPanelView(this).apply {
             onScrubStart = {
@@ -201,6 +206,14 @@ class MainActivity : Activity() {
             addView(btn("Split") { splitSelected() })
             addView(btn("Delete") { deleteSelected() })
             addView(btn("Hide") { toggleHidden() })
+        }
+        val rowKeys = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btn("Easy Ease") { keyEase() })
+            addView(btn("Hold") { keyHold() })
+            addView(btn("Copy") { keyCopy() })
+            addView(btn("Paste") { keyPaste() })
+            addView(btn("Del key") { keyDelete() })
         }
         val row3 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -253,10 +266,11 @@ class MainActivity : Activity() {
             )
             addView(row1)
             addView(row2)
+            addView(rowKeys)
             addView(row3)
         }
         setContentView(root)
-        chromeViews = listOf(title, row1, row2)
+        chromeViews = listOf(title, row1, row2, rowKeys)
         refresh()
     }
 
@@ -265,7 +279,8 @@ class MainActivity : Activity() {
     private fun pushToView() {
         val c = session.currentComp()
         compView.setData(session.project, c, currentTime, selectedLayerId, playing)
-        layerTimeline.setData(session.project, c, currentTime, selectedLayerId)
+        pruneKeys(c)
+        layerTimeline.setData(session.project, c, currentTime, selectedLayerId, selectedKeys)
         updatePanel()
     }
 
@@ -286,6 +301,7 @@ class MainActivity : Activity() {
     }
 
     private fun selectLayer(id: Long) {
+        if (id != selectedLayerId) selectedKeys = emptySet()
         selectedLayerId = id
         refresh()
     }
@@ -895,6 +911,103 @@ class MainActivity : Activity() {
         session.edit { p ->
             p.withLayerProp(c.id, l.id, path) { pr -> withKeySmooth(pr, idx, smooth) }
         }
+        refresh()
+    }
+
+    // ---------- keyframes selected on the timeline ----------
+
+    // forgets selected keyframes that no longer exist
+    private fun pruneKeys(c: Comp?) {
+        val l = c?.layers?.firstOrNull { it.id == selectedLayerId }
+        if (l == null) {
+            selectedKeys = emptySet()
+        } else {
+            val all = l.props.values.flatMap { pr -> pr.keys.map { it.time } }.toSet()
+            selectedKeys = selectedKeys.filter { it in all }.toSet()
+        }
+    }
+
+    private fun selectKey(t: Long, toggle: Boolean) {
+        selectedKeys = when {
+            !toggle -> setOf(t)
+            t in selectedKeys -> selectedKeys - t
+            else -> selectedKeys + t
+        }
+        pushToView()
+    }
+
+    private fun moveSelectedKeys(delta: Long) {
+        val sel = selectedPair() ?: return
+        val old = selectedKeys
+        session.edit { p ->
+            p.withLayerAllProps(sel.first.id, sel.second.id) { _, pr -> withKeysMoved(pr, old, delta) }
+        }
+        selectedKeys = old.map { it + delta }.toSet()
+        refresh()
+    }
+
+    // runs an edit on the selected keyframes of the selected layer
+    private fun keyEdit(change: (Prop) -> Prop) {
+        val sel = selectedPair()
+        if (sel == null || selectedKeys.isEmpty()) {
+            toast("Tap a keyframe diamond on the layer first")
+            return
+        }
+        session.edit { p -> p.withLayerAllProps(sel.first.id, sel.second.id) { _, pr -> change(pr) } }
+        refresh()
+    }
+
+    private fun keyEase() = keyEdit { pr -> withEasyEase(pr, selectedKeys) }
+
+    private fun keyHold() = keyEdit { pr -> withToggleHold(pr, selectedKeys) }
+
+    private fun keyDelete() {
+        keyEdit { pr -> withKeysDeleted(pr, selectedKeys) }
+        selectedKeys = emptySet()
+        refresh()
+    }
+
+    private fun keyCopy() {
+        val sel = selectedPair()
+        if (sel == null || selectedKeys.isEmpty()) {
+            toast("Tap a keyframe diamond on the layer first")
+            return
+        }
+        val copied = HashMap<String, List<Keyframe>>()
+        for ((path, pr) in sel.second.props) {
+            val ks = keysAtTimes(pr, selectedKeys)
+            if (ks.isNotEmpty()) copied[path] = ks
+        }
+        keyClip = copied
+        toast("Copied ${copied.values.sumOf { it.size }} keyframes")
+    }
+
+    // pastes at the playhead, onto the same properties of the selected layer
+    private fun keyPaste() {
+        if (keyClip.isEmpty()) {
+            toast("Copy keyframes first")
+            return
+        }
+        val sel = selectedPair()
+        if (sel == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val c = sel.first
+        val l = sel.second
+        val lt = layerTimeNow(c, l)
+        if (lt < 0L) {
+            toast("Move the playhead inside the layer")
+            return
+        }
+        val first = keyClip.values.flatten().minOf { it.time }
+        session.edit { p ->
+            p.withLayerAllProps(c.id, l.id) { path, pr ->
+                val ks = keyClip[path]
+                if (ks == null) pr else withKeysPasted(pr, ks, lt)
+            }
+        }
+        selectedKeys = keyClip.values.flatten().map { lt + (it.time - first) }.toSet()
         refresh()
     }
 

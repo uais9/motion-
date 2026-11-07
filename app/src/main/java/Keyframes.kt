@@ -462,6 +462,77 @@ fun withKeyTangent(prop: Prop, index: Int, isOut: Boolean, vec: List<Double>): P
     return prop.copy(keys = keys)
 }
 
+// ---------- selected keyframes (the timeline) ----------
+// `times` are keyframe times (layer time). These act on every property that has a keyframe there.
+
+// Changes every property of one layer.
+fun Project.withLayerAllProps(compId: Long, layerId: Long, change: (String, Prop) -> Prop): Project =
+    mapComp(compId) { c ->
+        c.copy(layers = c.layers.map { l ->
+            if (l.id != layerId) l else l.copy(props = l.props.mapValues { (path, pr) -> change(path, pr) })
+        })
+    }
+
+// Moves the keyframes at `times` by `delta` ticks. A moved keyframe replaces one it lands on.
+fun withKeysMoved(prop: Prop, times: Set<Long>, delta: Long): Prop {
+    if (!prop.animated || delta == 0L || prop.keys.none { it.time in times }) return prop
+    val moved = prop.keys.filter { it.time in times }.map { it.copy(time = it.time + delta) }
+    val landed = moved.map { it.time }.toSet()
+    val kept = prop.keys.filter { it.time !in times && it.time !in landed }
+    return smoothen(prop.copy(keys = (kept + moved).sortedBy { it.time }))
+}
+
+fun withKeysDeleted(prop: Prop, times: Set<Long>): Prop {
+    var p = prop
+    for (t in times) p = deleteKeyAt(p, t)
+    return p
+}
+
+// Easy Ease (F9): speed 0 with 33.33% influence on both sides of each selected keyframe.
+fun withEasyEase(prop: Prop, times: Set<Long>): Prop {
+    if (!prop.animated || prop.keys.none { it.time in times }) return prop
+    val keys = prop.keys.toMutableList()
+    val n = keys.size
+    fun base(k: Keyframe): List<Double> = if (k.interp == Interp.BEZIER) easeOf(k) else LINEAR_EASE
+    for (i in 0 until n) {
+        if (keys[i].time !in times) continue
+        if (i + 1 < n && keys[i].interp != Interp.HOLD) { // leaving this keyframe
+            val e = base(keys[i])
+            keys[i] = keys[i].copy(interp = Interp.BEZIER, ease = listOf(0.3333, 0.0, e[2], e[3]))
+        }
+        if (i > 0 && keys[i - 1].interp != Interp.HOLD) { // arriving at this keyframe
+            val e = base(keys[i - 1])
+            keys[i - 1] = keys[i - 1].copy(interp = Interp.BEZIER, ease = listOf(e[0], e[1], 0.6667, 1.0))
+        }
+        keys[i] = keys[i].copy(smooth = Smooth.NONE)
+    }
+    return smoothen(prop.copy(keys = keys))
+}
+
+// Toggle Hold Keyframe: if every selected keyframe already holds, they go back to Linear, otherwise they all hold.
+fun withToggleHold(prop: Prop, times: Set<Long>): Prop {
+    if (!prop.animated) return prop
+    val idx = prop.keys.indices.filter { prop.keys[it].time in times && it + 1 < prop.keys.size }
+    if (idx.isEmpty()) return prop
+    val allHold = idx.all { prop.keys[it].interp == Interp.HOLD }
+    val keys = prop.keys.toMutableList()
+    for (i in idx) keys[i] = keys[i].copy(interp = if (allHold) Interp.LINEAR else Interp.HOLD)
+    return smoothen(prop.copy(keys = keys))
+}
+
+// Copy and paste: the copied keyframes keep their type, handles and spacing.
+fun keysAtTimes(prop: Prop, times: Set<Long>): List<Keyframe> = prop.keys.filter { it.time in times }
+
+// Pastes the copied keyframes so the first one lands at layer time `at`. Makes the property animated.
+fun withKeysPasted(prop: Prop, copied: List<Keyframe>, at: Long): Prop {
+    if (copied.isEmpty() || copied.any { it.value.size != prop.value.size }) return prop
+    val first = copied.minOf { it.time }
+    val made = copied.map { it.copy(time = at + (it.time - first)) }
+    val landed = made.map { it.time }.toSet()
+    val kept = prop.keys.filter { it.time !in landed }
+    return smoothen(prop.copy(keys = (kept + made).sortedBy { it.time }))
+}
+
 // ---------- graph editor ----------
 
 // Sets how the segment that starts at keyframe `index` moves to the next keyframe.
@@ -621,6 +692,18 @@ object KeyframeTest {
         check("the stopwatch keeps a property spatial", withAnim.spatial && deleteKeyAt(withAnim, 0L).spatial)
         val pathBack = after.withLayerProp(compId, layer.id, Path.POSITION) { withPathType(curved, 1, PathType.CONTINUOUS) }
         check("motion paths survive save and load", ProjectJson.decode(ProjectJson.encode(pathBack)).project == pathBack)
+        // the timeline: move, ease, hold, copy, paste, delete
+        val tl = Prop(listOf(0.0), listOf(Keyframe(0L, listOf(0.0)), Keyframe(sec, listOf(50.0)), Keyframe(sec * 2, listOf(200.0))))
+        check("moving a selected keyframe shifts only that one", withKeysMoved(tl, setOf(sec), sec / 2).keys.map { it.time } == listOf(0L, sec + sec / 2, sec * 2))
+        val over = withKeysMoved(tl, setOf(sec), sec)
+        check("a keyframe moved onto another replaces it", over.keys.size == 2 && over.keys[1].value == listOf(50.0))
+        val ee = withEasyEase(tl, setOf(sec))
+        check("easy ease: speed 0, 33.33% influence on both sides of the keyframe", ee.keys[0].ease[2] == 0.6667 && ee.keys[0].ease[3] == 1.0 && ee.keys[1].ease[0] == 0.3333 && ee.keys[1].ease[1] == 0.0)
+        val h1 = withToggleHold(tl, setOf(0L, sec))
+        check("toggle hold holds, and toggled again goes back to linear", h1.keys[0].interp == Interp.HOLD && h1.keys[1].interp == Interp.HOLD && withToggleHold(h1, setOf(0L, sec)).keys[0].interp == Interp.LINEAR)
+        val pasted = withKeysPasted(tl, keysAtTimes(tl, setOf(0L, sec)), sec * 3)
+        check("paste puts the keyframes at the playhead with the same spacing", pasted.keys.map { it.time } == listOf(0L, sec, sec * 2, sec * 3, sec * 4))
+        check("delete removes the selected keyframes", withKeysDeleted(tl, setOf(0L, sec)).keys.map { it.time } == listOf(sec * 2))
         val withSmooth = after.withLayerProp(compId, layer.id, Path.OPACITY) {
             withKeySmooth(
                 Prop(
