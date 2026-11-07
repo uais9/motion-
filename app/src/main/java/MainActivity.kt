@@ -44,6 +44,10 @@ class MainActivity : Activity() {
     // keyframes selected on the timeline (layer times) and the copied ones, by property
     private var selectedKeys: Set<Long> = emptySet()
     private var keyClip: Map<String, List<Keyframe>> = emptyMap()
+    // Motion Sketch: the finger path being drawn (layer time, [x, y]) and the Smoother tolerance to use after
+    private val sketchSamples = ArrayList<Pair<Long, List<Double>>>()
+    private var sketchActive = false
+    private var sketchSmoothing = 1.0
     private lateinit var playBtn: Button
     private lateinit var loopBtn: Button
     private lateinit var exporter: Exporter
@@ -147,6 +151,9 @@ class MainActivity : Activity() {
             onPathKey = { idx, x, y -> moveKeyOnPath(idx, x, y) }
             onPathTangent = { idx, isOut, vec -> moveTangentLive(Path.POSITION, idx, isOut, vec) }
             onPathEditEnd = { endScrub() }
+            onSketchStart = { x, y -> sketchStart(x, y) }
+            onSketchPoint = { x, y -> sketchPoint(x, y) }
+            onSketchEnd = { sketchEnd() }
         }
         timeLabel = TextView(this).apply {
             setTextColor(Color.parseColor("#4DA3FF"))
@@ -161,6 +168,7 @@ class MainActivity : Activity() {
             onTrim = { id, edge, target -> trimLayer(id, edge, target) }
             onKeySelect = { t, toggle -> selectKey(t, toggle) }
             onKeysMove = { d -> moveSelectedKeys(d) }
+            onKeysScale = { anchor, factor -> scaleSelectedKeys(anchor, factor) }
         }
         panel = PropertyPanelView(this).apply {
             onScrubStart = {
@@ -214,6 +222,7 @@ class MainActivity : Activity() {
             addView(btn("Copy") { keyCopy() })
             addView(btn("Paste") { keyPaste() })
             addView(btn("Del key") { keyDelete() })
+            addView(btn("Animation") { showAnimationMenu() })
         }
         val row3 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1008,6 +1017,331 @@ class MainActivity : Activity() {
             }
         }
         selectedKeys = keyClip.values.flatten().map { lt + (it.time - first) }.toSet()
+        refresh()
+    }
+
+    // Animation > Keyframe Interpolation: temporal, spatial (Position and Anchor only) and roving,
+    // for the keyframes selected on the timeline
+    private fun showInterpolationDialog() {
+        val sel = selectedPair()
+        if (sel == null || selectedKeys.isEmpty()) {
+            toast("Tap a keyframe diamond on the layer first")
+            return
+        }
+        val hasSpatial = sel.second.props.values.any { pr -> pr.spatial && pr.keys.any { it.time in selectedKeys } }
+        fun spinner(items: Array<String>): Spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
+        }
+        val temporal = spinner(arrayOf("Current Settings", "Linear", "Bezier", "Continuous Bezier", "Auto Bezier", "Hold"))
+        val spatial = spinner(arrayOf("Current Settings", "Linear", "Bezier", "Continuous Bezier", "Auto Bezier"))
+        val roving = spinner(arrayOf("Current Settings", "Rove Across Time", "Lock To Time"))
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(label("Temporal Interpolation"))
+            addView(temporal)
+            if (hasSpatial) {
+                addView(label("Spatial Interpolation"))
+                addView(spatial)
+                addView(label("Roving"))
+                addView(roving)
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Keyframe Interpolation")
+            .setView(form)
+            .setPositiveButton("OK") { _, _ ->
+                applyInterpolation(
+                    temporal.selectedItemPosition,
+                    if (hasSpatial) spatial.selectedItemPosition else 0,
+                    if (hasSpatial) roving.selectedItemPosition else 0
+                )
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // t: 0 = current, then Linear, Bezier, Continuous Bezier, Auto Bezier, Hold
+    // s: 0 = current, then Linear, Bezier, Continuous Bezier, Auto Bezier
+    // r: 0 = current, 1 = Rove Across Time, 2 = Lock To Time
+    private fun applyInterpolation(t: Int, s: Int, r: Int) {
+        val sel = selectedPair() ?: return
+        val times = selectedKeys
+        val spatialTypes = arrayOf(PathType.LINEAR, PathType.BEZIER, PathType.CONTINUOUS, PathType.AUTO)
+        session.edit { p ->
+            p.withLayerAllProps(sel.first.id, sel.second.id) { _, pr ->
+                var x = pr
+                if (t > 0) x = withTemporalType(x, times, TemporalType.values()[t - 1])
+                if (s > 0 && x.spatial) x = withSpatialType(x, times, spatialTypes[s - 1])
+                if (r > 0 && x.spatial) x = withRoving(x, times, r == 1)
+                x
+            }
+        }
+        // roving keyframes change their time, so the selection is let go
+        if (r == 1) selectedKeys = emptySet()
+        refresh()
+    }
+
+    // ---------- Animation menu (like After Effects' Animation menu) ----------
+
+    private fun showAnimationMenu() {
+        val items = arrayOf(
+            "Keyframe Interpolation…", "Rove Across Time", "Toggle Hold Keyframe",
+            "Easy Ease", "Easy Ease In", "Easy Ease Out",
+            "Time-Reverse Keyframes", "Scale Keyframes in Time…", "Exponential Scale",
+            "Smoother…", "Wiggler…", "Motion Sketch…",
+            "Select All Keyframes", "Select Keyframes After", "Select Keyframes Before"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Animation")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> showInterpolationDialog()
+                    1 -> toggleRove()
+                    2 -> keyHold()
+                    3 -> keyEase()
+                    4 -> keyEdit { pr -> withEasyEase(pr, selectedKeys, 1) }
+                    5 -> keyEdit { pr -> withEasyEase(pr, selectedKeys, 2) }
+                    6 -> keyEdit { pr -> withKeysReversed(pr, selectedKeys) }
+                    7 -> showScaleKeysDialog()
+                    8 -> exponentialScale()
+                    9 -> showSmootherDialog()
+                    10 -> showWigglerDialog()
+                    11 -> showMotionSketchDialog()
+                    12 -> selectKeysWhere { _ -> true }
+                    13 -> selectKeysWhere { t -> t > (selectedKeys.maxOrNull() ?: Long.MAX_VALUE) }
+                    else -> selectKeysWhere { t -> t < (selectedKeys.minOrNull() ?: Long.MIN_VALUE) }
+                }
+            }
+            .show()
+    }
+
+    private fun allKeyTimes(): Set<Long> {
+        val l = selectedPair()?.second ?: return emptySet()
+        return l.props.values.flatMap { pr -> pr.keys.map { it.time } }.toSet()
+    }
+
+    private fun selectKeysWhere(keep: (Long) -> Boolean) {
+        if (selectedPair() == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        selectedKeys = allKeyTimes().filter(keep).toSet()
+        pushToView()
+    }
+
+    // Animation > Rove Across Time: toggles roving on the selected keyframes of Position and Anchor
+    private fun toggleRove() {
+        val sel = selectedPair()
+        if (sel == null || selectedKeys.isEmpty()) {
+            toast("Tap a keyframe diamond on the layer first")
+            return
+        }
+        val anyRove = sel.second.props.values.any { pr -> pr.spatial && pr.keys.any { it.time in selectedKeys && it.rove } }
+        applyInterpolation(0, 0, if (anyRove) 2 else 1)
+    }
+
+    // stretches or squeezes the selected keyframes in time around anchor (layer time)
+    private fun scaleSelectedKeys(anchor: Long, factor: Double) {
+        val sel = selectedPair() ?: return
+        val old = selectedKeys
+        val tpf = sel.first.frameRate.ticksPerFrame
+        session.edit { p ->
+            p.withLayerAllProps(sel.first.id, sel.second.id) { _, pr -> withKeysScaled(pr, old, anchor, factor, tpf) }
+        }
+        selectedKeys = scaledTimes(old.sorted(), anchor, factor, tpf).toSet()
+        refresh()
+    }
+
+    // the same thing from a menu: scale around the first selected keyframe
+    private fun showScaleKeysDialog() {
+        if (selectedPair() == null || selectedKeys.size < 2) {
+            toast("Select two or more keyframes first")
+            return
+        }
+        val pct = numEdit(100.0)
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(formRow("Time scale (%), around the first selected keyframe", pct))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Scale Keyframes in Time")
+            .setView(form)
+            .setPositiveButton("OK") { _, _ ->
+                val v = pct.text.toString().toDoubleOrNull()
+                if (v == null || v <= 0.0) toast("Check the number") else scaleSelectedKeys(selectedKeys.min(), v / 100.0)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // Exponential Scale: the Scale keyframes between the first and last selected one become exponential
+    private fun exponentialScale() {
+        val sel = selectedPair()
+        val pr = sel?.second?.props?.get(Path.SCALE)
+        if (sel == null || pr == null || pr.keys.count { it.time in selectedKeys } < 2) {
+            toast("Select a start and an end Scale keyframe first")
+            return
+        }
+        val tpf = sel.first.frameRate.ticksPerFrame
+        session.edit { p ->
+            p.withLayerProp(sel.first.id, sel.second.id, Path.SCALE) { x -> withExponentialScale(x, selectedKeys, tpf) }
+        }
+        refresh()
+    }
+
+    private fun spinnerOf(items: Array<String>): Spinner = Spinner(this).apply {
+        adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
+    }
+
+    // Window > Smoother
+    private fun showSmootherDialog() {
+        val sel = selectedPair()
+        if (sel == null || selectedKeys.size < 2) {
+            toast("Select two or more keyframes first")
+            return
+        }
+        val applyTo = spinnerOf(arrayOf("Spatial Path", "Temporal Graph"))
+        val tolerance = numEdit(5.0)
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(label("Apply To"))
+            addView(applyTo)
+            addView(formRow("Tolerance", tolerance))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Smoother")
+            .setView(form)
+            .setPositiveButton("Apply") { _, _ ->
+                val tol = tolerance.text.toString().toDoubleOrNull()
+                if (tol == null || tol < 0.0) {
+                    toast("Check the number")
+                } else {
+                    val spatial = applyTo.selectedItemPosition == 0
+                    val times = selectedKeys
+                    session.edit { p ->
+                        p.withLayerAllProps(sel.first.id, sel.second.id) { _, pr -> withSmoothed(pr, times, tol, spatial) }
+                    }
+                    refresh()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // Window > Wiggler
+    private fun showWigglerDialog() {
+        val sel = selectedPair()
+        if (sel == null || selectedKeys.size < 2) {
+            toast("Select two or more keyframes first")
+            return
+        }
+        val noise = spinnerOf(arrayOf("Smooth", "Jagged"))
+        val dims = spinnerOf(arrayOf("All The Same", "All Independent", "X", "Y"))
+        val frequency = numEdit(5.0)
+        val magnitude = numEdit(1.0)
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(label("Noise Type"))
+            addView(noise)
+            addView(label("Dimensions"))
+            addView(dims)
+            addView(formRow("Frequency (per second)", frequency))
+            addView(formRow("Magnitude", magnitude))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Wiggler")
+            .setView(form)
+            .setPositiveButton("Apply") { _, _ ->
+                val fq = frequency.text.toString().toDoubleOrNull()
+                val mg = magnitude.text.toString().toDoubleOrNull()
+                if (fq == null || mg == null || fq <= 0.0) {
+                    toast("Check the numbers")
+                } else {
+                    val tpf = sel.first.frameRate.ticksPerFrame
+                    val times = selectedKeys
+                    val seed = System.nanoTime()
+                    session.edit { p ->
+                        p.withLayerAllProps(sel.first.id, sel.second.id) { _, pr ->
+                            withWiggle(pr, times, noise.selectedItemPosition == 0, dims.selectedItemPosition, fq, mg, tpf, seed)
+                        }
+                    }
+                    refresh()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // Window > Motion Sketch: then touch and drag on the preview, time plays while you draw
+    private fun showMotionSketchDialog() {
+        val sel = selectedPair()
+        if (sel == null || sel.second.props[Path.POSITION] == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val smoothing = numEdit(sketchSmoothing)
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(TextView(this@MainActivity).apply {
+                text = "Sketches the Position of the selected layer. Press Start, then touch and drag on the preview: time plays at normal speed while you draw. Let go to stop."
+            })
+            addView(formRow("Smoothing (0 = keep every point)", smoothing))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Motion Sketch")
+            .setView(form)
+            .setPositiveButton("Start") { _, _ ->
+                sketchSmoothing = (smoothing.text.toString().toDoubleOrNull() ?: 1.0).coerceAtLeast(0.0)
+                compView.sketchMode = true
+                toast("Touch and drag on the preview")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun sketchStart(x: Double, y: Double) {
+        val sel = selectedPair()
+        if (sel == null) {
+            compView.sketchMode = false
+            return
+        }
+        sketchSamples.clear()
+        sketchActive = true
+        sketchSamples.add(Pair(currentTime - sel.second.startTime, listOf(x, y)))
+        startPlay()
+    }
+
+    private fun sketchPoint(x: Double, y: Double) {
+        if (!sketchActive) return
+        val sel = selectedPair() ?: return
+        sketchSamples.add(Pair(currentTime - sel.second.startTime, listOf(x, y)))
+    }
+
+    private fun sketchEnd() {
+        compView.sketchMode = false
+        if (!sketchActive) return
+        sketchActive = false
+        stopPlay()
+        val sel = selectedPair() ?: return
+        val tpf = sel.first.frameRate.ticksPerFrame
+        val samples = ArrayList(sketchSamples)
+        sketchSamples.clear()
+        if (samples.size < 2) {
+            toast("Nothing was sketched")
+            refresh()
+            return
+        }
+        session.edit { p ->
+            p.withLayerProp(sel.first.id, sel.second.id, Path.POSITION) { pr ->
+                withSketchedPath(pr, samples, tpf, sketchSmoothing)
+            }
+        }
+        selectedKeys = emptySet()
         refresh()
     }
 

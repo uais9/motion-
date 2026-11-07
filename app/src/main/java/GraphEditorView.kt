@@ -35,7 +35,7 @@ import kotlin.math.sqrt
 class GraphEditorView(context: Context) : View(context) {
 
     // side: 0 = whole segment, 1 = only the start handle (ease out), 2 = only the end handle (ease in),
-    // 3 = not a preset, opens the numbers dialog
+    // 3 = not a preset, opens the numbers dialog, 5 = Auto Bezier on both keyframes of the segment
     private class Preset(val label: String, val interp: Interp, val ease: List<Double>, val side: Int = 0)
 
     private class Mapping(val t0: Long, val t1: Long, val vmin: Double, val vmax: Double)
@@ -48,6 +48,7 @@ class GraphEditorView(context: Context) : View(context) {
             Preset("Easy Ease", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0)),
             Preset("Ease In", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 2),
             Preset("Ease Out", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 1),
+            Preset("Auto", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 5),
             Preset("Hold", Interp.HOLD, listOf(0.33, 0.0, 0.67, 1.0)),
             Preset("Numbers", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0), 3)
         )
@@ -391,7 +392,7 @@ class GraphEditorView(context: Context) : View(context) {
         val presetSel = if (seg >= 0) p.keys[seg] else null
         for (i in PRESETS.indices) {
             val pr = PRESETS[i]
-            var on = false
+            var on = pr.side == 5 && seg >= 0 && p.keys[seg].smooth == Smooth.AUTO && p.keys[seg + 1].smooth == Smooth.AUTO
             if (presetSel != null && presetSel.interp == pr.interp && pr.side < 3) {
                 val e = easeOf(presetSel)
                 on = when (pr.side) {
@@ -1147,6 +1148,11 @@ class GraphEditorView(context: Context) : View(context) {
                 val seg = segIndex(p.keys)
                 if (seg < 0) return
                 val pr = PRESETS[targetIndex]
+                if (pr.side == 5) {
+                    onSmooth?.invoke(selPath, seg, Smooth.AUTO)
+                    onSmooth?.invoke(selPath, seg + 1, Smooth.AUTO)
+                    return
+                }
                 if (pr.side == 3) {
                     showVelocityDialog(p, seg)
                     return

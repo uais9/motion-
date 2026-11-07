@@ -29,7 +29,10 @@ data class Keyframe(
     // motion path (only for a spatial Prop): inTan / outTan are the handles, as offsets from the keyframe's value
     val pathType: PathType = PathType.AUTO,
     val inTan: List<Double> = emptyList(),
-    val outTan: List<Double> = emptyList()
+    val outTan: List<Double> = emptyList(),
+    // Rove Across Time (spatial properties): the time of this keyframe is worked out so the speed along the path
+    // is even between the keyframes before and after it. Lock To Time is false.
+    val rove: Boolean = false
 )
 
 // A property is a fixed value, or a list of keyframes that animate it.

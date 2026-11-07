@@ -2,6 +2,7 @@ package com.motion
 
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.roundToLong
 import kotlin.math.sqrt
 
 // All the keyframe logic in one place.
@@ -202,11 +203,47 @@ private fun relaxAuto(prop: Prop): Prop {
 // After the keyframes change: Auto Bezier handles are worked out again and Continuous keyframes
 // keep the same speed in and out.
 private fun smoothen(prop: Prop): Prop {
-    var p = relaxAuto(prop)
+    var p = relaxAuto(roveKeys(prop))
     for (i in 1 until p.keys.size - 1) {
         if (p.keys[i].smooth == Smooth.CONTINUOUS) p = followOut(p, i)
     }
     return p
+}
+
+// Roving keyframes: a run of roving keyframes between two keyframes that are locked to time is moved in
+// time so the speed along the path is even. The first and last keyframe can never rove.
+private fun roveKeys(prop: Prop): Prop {
+    if (!prop.spatial || prop.keys.none { it.rove }) return prop
+    val keys = prop.keys.toMutableList()
+    val n = keys.size
+    var i = 1
+    while (i < n - 1) {
+        if (!keys[i].rove) {
+            i++
+            continue
+        }
+        var j = i
+        while (j + 1 < n - 1 && keys[j + 1].rove) j++
+        val a = i - 1
+        val b = j + 1
+        val cum = DoubleArray(b - a + 1)
+        var total = 0.0
+        for (sg in a until b) {
+            total += abs(segmentLength(prop, sg))
+            cum[sg - a + 1] = total
+        }
+        if (total > 1e-9) {
+            var prevTime = keys[a].time
+            for (k in i..j) {
+                val t = keys[a].time + ((keys[b].time - keys[a].time) * (cum[k - a] / total)).roundToLong()
+                val safe = max(t, prevTime + 1L)
+                keys[k] = keys[k].copy(time = safe)
+                prevTime = safe
+            }
+        }
+        i = j + 1
+    }
+    return prop.copy(keys = keys)
 }
 
 // ---------- keyframes ----------
@@ -489,18 +526,19 @@ fun withKeysDeleted(prop: Prop, times: Set<Long>): Prop {
 }
 
 // Easy Ease (F9): speed 0 with 33.33% influence on both sides of each selected keyframe.
-fun withEasyEase(prop: Prop, times: Set<Long>): Prop {
+// side: 0 = both (Easy Ease), 1 = only arriving at the keyframe (Easy Ease In), 2 = only leaving it (Easy Ease Out)
+fun withEasyEase(prop: Prop, times: Set<Long>, side: Int = 0): Prop {
     if (!prop.animated || prop.keys.none { it.time in times }) return prop
     val keys = prop.keys.toMutableList()
     val n = keys.size
     fun base(k: Keyframe): List<Double> = if (k.interp == Interp.BEZIER) easeOf(k) else LINEAR_EASE
     for (i in 0 until n) {
         if (keys[i].time !in times) continue
-        if (i + 1 < n && keys[i].interp != Interp.HOLD) { // leaving this keyframe
+        if (side != 1 && i + 1 < n && keys[i].interp != Interp.HOLD) { // leaving this keyframe
             val e = base(keys[i])
             keys[i] = keys[i].copy(interp = Interp.BEZIER, ease = listOf(0.3333, 0.0, e[2], e[3]))
         }
-        if (i > 0 && keys[i - 1].interp != Interp.HOLD) { // arriving at this keyframe
+        if (side != 2 && i > 0 && keys[i - 1].interp != Interp.HOLD) { // arriving at this keyframe
             val e = base(keys[i - 1])
             keys[i - 1] = keys[i - 1].copy(interp = Interp.BEZIER, ease = listOf(e[0], e[1], 0.6667, 1.0))
         }
@@ -531,6 +569,339 @@ fun withKeysPasted(prop: Prop, copied: List<Keyframe>, at: Long): Prop {
     val landed = made.map { it.time }.toSet()
     val kept = prop.keys.filter { it.time !in landed }
     return smoothen(prop.copy(keys = (kept + made).sortedBy { it.time }))
+}
+
+// ---------- Keyframe Interpolation dialog ----------
+// Like Animation > Keyframe Interpolation in After Effects: temporal, spatial (Position and Anchor only) and roving.
+// The order of TemporalType matches the dialog's menu after "Current Settings".
+
+enum class TemporalType { LINEAR, BEZIER, CONTINUOUS, AUTO, HOLD }
+
+private fun nearEase(a: List<Double>, b: List<Double>): Boolean =
+    abs(a[0] - b[0]) < 1e-6 && abs(a[1] - b[1]) < 1e-6 && abs(a[2] - b[2]) < 1e-6 && abs(a[3] - b[3]) < 1e-6
+
+// Linear on both sides of keyframe i: the handles lie on the straight line. A segment whose two ends are
+// both Linear becomes a plain Linear segment.
+private fun makeLinear(prop: Prop, i: Int): Prop {
+    val keys = prop.keys.toMutableList()
+    if (i + 1 < keys.size && keys[i].interp != Interp.LINEAR) {
+        val e = if (keys[i].interp == Interp.BEZIER) easeOf(keys[i]) else LINEAR_EASE
+        val ne = listOf(LINEAR_EASE[0], LINEAR_EASE[1], e[2], e[3])
+        keys[i] = if (nearEase(ne, LINEAR_EASE)) keys[i].copy(interp = Interp.LINEAR, ease = LINEAR_EASE)
+        else keys[i].copy(interp = Interp.BEZIER, ease = ne)
+    }
+    if (i > 0 && keys[i - 1].interp != Interp.LINEAR) {
+        val e = if (keys[i - 1].interp == Interp.BEZIER) easeOf(keys[i - 1]) else LINEAR_EASE
+        val ne = listOf(e[0], e[1], LINEAR_EASE[2], LINEAR_EASE[3])
+        keys[i - 1] = if (nearEase(ne, LINEAR_EASE)) keys[i - 1].copy(interp = Interp.LINEAR, ease = LINEAR_EASE)
+        else keys[i - 1].copy(interp = Interp.BEZIER, ease = ne)
+    }
+    keys[i] = keys[i].copy(smooth = Smooth.NONE)
+    return prop.copy(keys = keys)
+}
+
+// Sets the temporal interpolation (in and out) of the keyframes at `times`.
+//  Linear / Hold: as named. Hold only holds the outgoing side, like After Effects.
+//  Auto Bezier: smooth speed through the keyframe, worked out for you.
+//  Bezier: starts from the Auto Bezier handles, the two handles are then independent.
+//  Continuous Bezier: starts from the Auto Bezier handles, the two stay smooth through the keyframe.
+fun withTemporalType(prop: Prop, times: Set<Long>, type: TemporalType): Prop {
+    if (!prop.animated) return prop
+    val idx = prop.keys.indices.filter { prop.keys[it].time in times }
+    if (idx.isEmpty()) return prop
+    var p = prop
+    for (i in idx) {
+        // a Hold on this keyframe's outgoing side is replaced by Bezier for the Bezier-type methods
+        if (type != TemporalType.LINEAR && type != TemporalType.HOLD && p.keys[i].interp == Interp.HOLD && i + 1 < p.keys.size) {
+            val ks = p.keys.toMutableList()
+            ks[i] = ks[i].copy(interp = Interp.BEZIER, ease = LINEAR_EASE)
+            p = p.copy(keys = ks)
+        }
+        p = when (type) {
+            TemporalType.LINEAR -> makeLinear(p, i)
+            TemporalType.HOLD -> {
+                val ks = p.keys.toMutableList()
+                if (i + 1 < ks.size) ks[i] = ks[i].copy(interp = Interp.HOLD, smooth = Smooth.NONE)
+                p.copy(keys = ks)
+            }
+            TemporalType.AUTO -> withKeySmooth(p, i, Smooth.AUTO)
+            TemporalType.CONTINUOUS -> {
+                val a = withKeySmooth(p, i, Smooth.AUTO)
+                val ks = a.keys.toMutableList()
+                ks[i] = ks[i].copy(smooth = Smooth.CONTINUOUS)
+                a.copy(keys = ks)
+            }
+            TemporalType.BEZIER -> {
+                val a = withKeySmooth(p, i, Smooth.AUTO)
+                val ks = a.keys.toMutableList()
+                ks[i] = ks[i].copy(smooth = Smooth.NONE)
+                a.copy(keys = ks)
+            }
+        }
+    }
+    return smoothen(p)
+}
+
+// Sets the spatial interpolation (the motion path) of the keyframes at `times`. Position and Anchor only.
+fun withSpatialType(prop: Prop, times: Set<Long>, type: PathType): Prop {
+    if (!prop.spatial) return prop
+    var p = prop
+    for (i in prop.keys.indices) {
+        if (prop.keys[i].time in times) p = withPathType(p, i, type)
+    }
+    return p
+}
+
+// Roving: Rove Across Time (true) or Lock To Time (false). Position and Anchor only; the first and last keyframe stay locked.
+fun withRoving(prop: Prop, times: Set<Long>, rove: Boolean): Prop {
+    if (!prop.spatial || !prop.animated) return prop
+    val keys = prop.keys.mapIndexed { i, k ->
+        if (k.time in times && i > 0 && i < prop.keys.size - 1) k.copy(rove = rove) else k
+    }
+    return smoothen(prop.copy(keys = keys))
+}
+
+// ---------- Animation > Keyframe Assistant ----------
+
+private fun mirrorEase(e: List<Double>): List<Double> = listOf(1.0 - e[2], 1.0 - e[3], 1.0 - e[0], 1.0 - e[1])
+
+// Time-Reverse Keyframes: the selected keyframes of a property play backwards, inside their own time range
+// (each property is reversed within its own selected range, like After Effects). A segment that was easing
+// in now eases out, and the motion path handles swap sides.
+fun withKeysReversed(prop: Prop, times: Set<Long>): Prop {
+    val idx = prop.keys.indices.filter { prop.keys[it].time in times }
+    if (idx.size < 2) return prop
+    val selected = idx.toSet()
+    val t0 = prop.keys[idx.first()].time
+    val t1 = prop.keys[idx.last()].time
+    val moved = idx.map { i ->
+        val k = prop.keys[i]
+        // the segment that now starts at this keyframe is the one that used to end at it
+        val before = if (i - 1 in selected) prop.keys[i - 1] else null
+        val interp = before?.interp ?: k.interp
+        val ease = if (before != null) mirrorEase(easeOf(before)) else k.ease
+        k.copy(time = t0 + t1 - k.time, interp = interp, ease = ease, inTan = k.outTan, outTan = k.inTan)
+    }
+    val landed = moved.map { it.time }.toSet()
+    val kept = prop.keys.filter { it.time !in times && it.time !in landed }
+    return smoothen(prop.copy(keys = (kept + moved).sortedBy { it.time }))
+}
+
+// The times the selected keyframes get when they are scaled in time around `anchor`, snapped to `snap` ticks.
+fun scaledTimes(sorted: List<Long>, anchor: Long, factor: Double, snap: Long): List<Long> {
+    var last = Long.MIN_VALUE
+    val out = ArrayList<Long>()
+    for (t in sorted) {
+        var n = anchor + Math.round((t - anchor) * factor)
+        if (snap > 0L) n = Math.round(n.toDouble() / snap) * snap
+        if (n <= last) n = last + max(1L, snap)
+        out.add(n)
+        last = n
+    }
+    return out
+}
+
+// Scale in time (Alt-drag the first or last selected keyframe in After Effects): the selected keyframes
+// are spread out or squeezed around `anchor`.
+fun withKeysScaled(prop: Prop, times: Set<Long>, anchor: Long, factor: Double, snap: Long): Prop {
+    if (!prop.animated || factor <= 0.0) return prop
+    val sel = prop.keys.filter { it.time in times }.sortedBy { it.time }
+    if (sel.isEmpty()) return prop
+    val newTimes = scaledTimes(sel.map { it.time }, anchor, factor, snap)
+    val moved = sel.mapIndexed { i, k -> k.copy(time = newTimes[i]) }
+    val landed = newTimes.toSet()
+    val kept = prop.keys.filter { it.time !in times && it.time !in landed }
+    return smoothen(prop.copy(keys = (kept + moved).sortedBy { it.time }))
+}
+
+// Exponential Scale: between the first and last selected keyframe the scale grows by the same percentage
+// every frame (a zoom lens), instead of by the same amount. It replaces the keyframes in between with one
+// keyframe per frame, like After Effects.
+fun withExponentialScale(prop: Prop, times: Set<Long>, tpf: Long): Prop {
+    val sel = prop.keys.filter { it.time in times }
+    if (sel.size < 2 || tpf <= 0L) return prop
+    val a = sel.first()
+    val b = sel.last()
+    val made = ArrayList<Keyframe>()
+    var t = a.time + tpf
+    while (t < b.time) {
+        val u = (t - a.time).toDouble() / (b.time - a.time)
+        val v = a.value.indices.map { d ->
+            val v0 = a.value[d]
+            val v1 = b.value.getOrElse(d) { v0 }
+            if (v0 > 0.0 && v1 > 0.0) v0 * Math.pow(v1 / v0, u) else v0 + (v1 - v0) * u
+        }
+        made.add(Keyframe(t, v))
+        t += tpf
+    }
+    val kept = prop.keys.filter { it.time <= a.time || it.time >= b.time }
+        .map { if (it.time == a.time) it.copy(interp = Interp.LINEAR, smooth = Smooth.NONE) else it }
+    return smoothen(prop.copy(keys = (kept + made).sortedBy { it.time }))
+}
+
+// Smoother: replaces the selected keyframes with fewer ones that stay within `tolerance` of the original
+// curve (Douglas-Peucker), then makes them Auto Bezier. spatial = true smooths the motion path (Position and
+// Anchor), false smooths the value over time.
+fun withSmoothed(prop: Prop, times: Set<Long>, tolerance: Double, spatial: Boolean): Prop {
+    val idx = prop.keys.indices.filter { prop.keys[it].time in times }
+    if (idx.size < 2) return prop
+    val sel = idx.map { prop.keys[it] }
+    val n = sel.size
+    val keep = BooleanArray(n)
+    keep[0] = true
+    keep[n - 1] = true
+    val usePath = spatial && prop.spatial
+    fun deviation(i: Int, lo: Int, hi: Int): Double {
+        val k = sel[i]
+        val a = sel[lo]
+        val b = sel[hi]
+        val dims = a.value.size
+        if (usePath) {
+            var vv = 0.0
+            var wv = 0.0
+            for (d in 0 until dims) {
+                val v = b.value.getOrElse(d) { a.value[d] } - a.value[d]
+                val w = k.value.getOrElse(d) { a.value[d] } - a.value[d]
+                vv += v * v
+                wv += w * w
+            }
+            var dot = 0.0
+            for (d in 0 until dims) {
+                dot += (b.value.getOrElse(d) { a.value[d] } - a.value[d]) * (k.value.getOrElse(d) { a.value[d] } - a.value[d])
+            }
+            val u = if (vv < 1e-12) 0.0 else (dot / vv).coerceIn(0.0, 1.0)
+            var dist = 0.0
+            for (d in 0 until dims) {
+                val cp = a.value[d] + (b.value.getOrElse(d) { a.value[d] } - a.value[d]) * u
+                val diff = k.value.getOrElse(d) { a.value[d] } - cp
+                dist += diff * diff
+            }
+            return sqrt(dist)
+        }
+        val u = (k.time - a.time).toDouble() / max(1L, b.time - a.time)
+        var worst = 0.0
+        for (d in 0 until dims) {
+            val lerp = a.value[d] + (b.value.getOrElse(d) { a.value[d] } - a.value[d]) * u
+            worst = max(worst, abs(k.value.getOrElse(d) { lerp } - lerp))
+        }
+        return worst
+    }
+    fun split(lo: Int, hi: Int) {
+        if (hi - lo < 2) return
+        var best = -1
+        var bestDev = 0.0
+        for (i in lo + 1 until hi) {
+            val d = deviation(i, lo, hi)
+            if (d > bestDev) {
+                bestDev = d
+                best = i
+            }
+        }
+        if (best >= 0 && bestDev > tolerance) {
+            keep[best] = true
+            split(lo, best)
+            split(best, hi)
+        }
+    }
+    split(0, n - 1)
+    val kept = ArrayList<Keyframe>()
+    for (i in 0 until n) {
+        if (!keep[i]) continue
+        val k = sel[i]
+        kept.add(
+            if (usePath) {
+                k.copy(pathType = PathType.AUTO)
+            } else {
+                // smoothing the value over time makes each keyframe Bezier, like After Effects
+                k.copy(
+                    interp = if (i < n - 1 && k.interp == Interp.HOLD) Interp.HOLD else if (i < n - 1) Interp.BEZIER else k.interp,
+                    ease = if (k.interp == Interp.BEZIER) k.ease else LINEAR_EASE,
+                    smooth = Smooth.AUTO
+                )
+            }
+        )
+    }
+    val others = prop.keys.filter { it.time !in times }
+    return smoothen(prop.copy(keys = (others + kept).sortedBy { it.time }))
+}
+
+// Wiggler: adds keyframes at `frequency` per second between the first and last selected keyframe, each moved
+// by a random amount up to `magnitude` (in the property's own units). The selected keyframes in between are
+// moved too; the first and last stay. dims: 0 = all the same, 1 = all independent, 2 = X only, 3 = Y only.
+// Smooth noise makes the keyframes Auto Bezier, jagged noise leaves them Linear.
+fun withWiggle(prop: Prop, times: Set<Long>, smooth: Boolean, dims: Int, frequency: Double, magnitude: Double, tpf: Long, seed: Long): Prop {
+    val sel = prop.keys.filter { it.time in times }
+    if (sel.size < 2 || frequency <= 0.0 || magnitude == 0.0 || tpf <= 0L) return prop
+    val t0 = sel.first().time
+    val t1 = sel.last().time
+    val rnd = java.util.Random(seed)
+    val n = prop.value.size
+    fun noise(): List<Double> {
+        val same = (rnd.nextDouble() * 2.0 - 1.0) * magnitude
+        return List(n) { d ->
+            when (dims) {
+                0 -> same
+                1 -> (rnd.nextDouble() * 2.0 - 1.0) * magnitude
+                else -> if (d == dims - 2) (rnd.nextDouble() * 2.0 - 1.0) * magnitude else 0.0
+            }
+        }
+    }
+    val step = max(tpf, (TICKS_PER_SECOND / frequency).roundToLong() / tpf * tpf)
+    fun styled(k: Keyframe): Keyframe =
+        if (smooth) k.copy(interp = Interp.BEZIER, ease = LINEAR_EASE, smooth = Smooth.AUTO) else k.copy(interp = Interp.LINEAR, smooth = Smooth.NONE)
+    val made = ArrayList<Keyframe>()
+    var t = t0 + step
+    while (t < t1) {
+        val base = Eval.valueAt(prop, t)
+        val nz = noise()
+        made.add(styled(Keyframe(t, List(n) { base.getOrElse(it) { 0.0 } + nz[it] })))
+        t += step
+    }
+    val landed = made.map { it.time }.toSet()
+    val keys = ArrayList<Keyframe>()
+    for (k in prop.keys) {
+        if (k.time in landed) continue
+        if (k.time in times && k.time != t0 && k.time != t1) {
+            val nz = noise()
+            keys.add(styled(k.copy(value = List(n) { k.value.getOrElse(it) { 0.0 } + nz[it] })))
+        } else {
+            keys.add(k)
+        }
+    }
+    return smoothen(prop.copy(keys = (keys + made).sortedBy { it.time }))
+}
+
+// Motion Sketch: the finger path you drew becomes one Position keyframe per frame, replacing the keyframes
+// in that time range (like After Effects). `samples` are (layer time, [x, y]). `smoothing` is the Smoother
+// tolerance applied to the new keyframes (0 = none).
+fun withSketchedPath(prop: Prop, samples: List<Pair<Long, List<Double>>>, tpf: Long, smoothing: Double): Prop {
+    if (!prop.spatial || samples.size < 2 || tpf <= 0L) return prop
+    val pts = samples.sortedBy { it.first }
+    val t0 = Math.round(pts.first().first.toDouble() / tpf) * tpf
+    val t1 = Math.round(pts.last().first.toDouble() / tpf) * tpf
+    if (t1 <= t0) return prop
+    fun at(t: Long): List<Double> {
+        var i = 0
+        while (i < pts.size - 2 && pts[i + 1].first <= t) i++
+        val a = pts[i]
+        val b = pts[i + 1]
+        val span = (b.first - a.first).toDouble()
+        val u = if (span <= 0.0) 0.0 else ((t - a.first) / span).coerceIn(0.0, 1.0)
+        return List(prop.value.size) { d ->
+            val av = a.second.getOrElse(d) { prop.value[d] }
+            val bv = b.second.getOrElse(d) { av }
+            av + (bv - av) * u
+        }
+    }
+    val made = ArrayList<Keyframe>()
+    var t = t0
+    while (t <= t1) {
+        made.add(Keyframe(t, at(t)))
+        t += tpf
+    }
+    val kept = prop.keys.filter { it.time < t0 || it.time > t1 }
+    val result = smoothen(prop.copy(keys = (kept + made).sortedBy { it.time }))
+    return if (smoothing > 0.0) withSmoothed(result, made.map { it.time }.toSet(), smoothing, true) else result
 }
 
 // ---------- graph editor ----------
@@ -704,6 +1075,50 @@ object KeyframeTest {
         val pasted = withKeysPasted(tl, keysAtTimes(tl, setOf(0L, sec)), sec * 3)
         check("paste puts the keyframes at the playhead with the same spacing", pasted.keys.map { it.time } == listOf(0L, sec, sec * 2, sec * 3, sec * 4))
         check("delete removes the selected keyframes", withKeysDeleted(tl, setOf(0L, sec)).keys.map { it.time } == listOf(sec * 2))
+        // the Keyframe Interpolation dialog
+        fun perSecond(v: Double?): Double = (v ?: 0.0) * sec
+        val autoT = withTemporalType(tl, setOf(sec), TemporalType.AUTO)
+        check("temporal auto bezier: same speed in and out", autoT.keys[1].smooth == Smooth.AUTO && nearD(perSecond(keySpeedIn(autoT, 1)), perSecond(keySpeedOut(autoT, 1))))
+        val contT = withTemporalType(tl, setOf(sec), TemporalType.CONTINUOUS)
+        check("temporal continuous bezier keeps the auto handles and the smooth link", contT.keys[1].smooth == Smooth.CONTINUOUS && nearD(perSecond(keySpeedIn(contT, 1)), perSecond(keySpeedOut(contT, 1))))
+        val bezT = withTemporalType(tl, setOf(sec), TemporalType.BEZIER)
+        check("temporal bezier starts from the auto handles, then they are independent", bezT.keys[1].smooth == Smooth.NONE && bezT.keys[1].interp == Interp.BEZIER && bezT.keys[0].interp == Interp.BEZIER)
+        val linT = withTemporalType(ee, setOf(sec), TemporalType.LINEAR)
+        check("temporal linear puts the handles on the straight line", linT.keys[0].interp == Interp.LINEAR && linT.keys[1].interp == Interp.LINEAR)
+        check("temporal hold holds the outgoing side only", withTemporalType(tl, setOf(sec), TemporalType.HOLD).keys.map { it.interp } == listOf(Interp.LINEAR, Interp.HOLD, Interp.LINEAR))
+        check("spatial interpolation sets the path type of the selected keyframe", withSpatialType(curved, setOf(sec), PathType.LINEAR).keys[1].pathType == PathType.LINEAR)
+        val straight = Prop(
+            listOf(0.0, 0.0),
+            listOf(Keyframe(0L, listOf(0.0, 0.0)), Keyframe(sec, listOf(50.0, 0.0)), Keyframe(sec * 3, listOf(100.0, 0.0))),
+            spatial = true
+        )
+        val roved = withRoving(straight, setOf(sec), true)
+        check("rove across time puts the keyframe where the speed is even", roved.keys[1].rove && roved.keys[1].time == sec * 3 / 2)
+        check("lock to time stops roving", !withRoving(roved, setOf(sec * 3 / 2), false).keys[1].rove)
+        check("the first and last keyframe cannot rove", withRoving(straight, setOf(0L, sec * 3), true).keys.none { it.rove })
+        // keyframe assistants
+        val rev = withKeysReversed(tl, setOf(0L, sec, sec * 2))
+        check("time-reverse plays the values backwards", rev.keys.map { it.value[0] } == listOf(200.0, 50.0, 0.0) && rev.keys.map { it.time } == listOf(0L, sec, sec * 2))
+        val eased = Prop(listOf(0.0), listOf(Keyframe(0L, listOf(0.0), Interp.BEZIER, listOf(0.4, 0.0, 1.0, 1.0)), Keyframe(sec, listOf(100.0))))
+        val revE = withKeysReversed(eased, setOf(0L, sec))
+        check("time-reverse mirrors the easing of the segment", revE.keys[0].interp == Interp.BEZIER && Math.abs(revE.keys[0].ease[2] - 0.6) < 1e-9 && Math.abs(revE.keys[0].ease[1]) < 1e-9)
+        check("time-reverse needs two keyframes", withKeysReversed(tl, setOf(sec)) == tl)
+        check("scaling keyframes in time around the first one", withKeysScaled(tl, setOf(0L, sec, sec * 2), 0L, 2.0, sec / 30).keys.map { it.time } == listOf(0L, sec * 2, sec * 4))
+        val zoom = Prop(listOf(100.0, 100.0), listOf(Keyframe(0L, listOf(100.0, 100.0)), Keyframe(sec * 2, listOf(400.0, 400.0))))
+        val expo = withExponentialScale(zoom, setOf(0L, sec * 2), sec / 30)
+        check("exponential scale: one keyframe per frame", expo.keys.size == 60 + 1)
+        check("exponential scale: halfway is the geometric mean (200), not 250", nearD(Eval.valueAt(expo, sec)[0], 200.0))
+        val line5 = Prop(listOf(0.0), listOf(0, 1, 2, 3, 4).map { Keyframe(sec * it, listOf(25.0 * it)) })
+        val allT = line5.keys.map { it.time }.toSet()
+        check("smoother removes keyframes that lie on the curve", withSmoothed(line5, allT, 5.0, false).keys.size == 2)
+        val spike = Prop(listOf(0.0), listOf(0.0, 0.0, 100.0, 0.0, 0.0).mapIndexed { i, v -> Keyframe(sec * i, listOf(v)) })
+        check("smoother keeps the keyframes that matter", withSmoothed(spike, spike.keys.map { it.time }.toSet(), 5.0, false).keys.any { it.value[0] == 100.0 })
+        check("smoother makes the kept keyframes auto bezier", withSmoothed(line5, allT, 5.0, false).keys.all { it.smooth == Smooth.AUTO })
+        val wig = withWiggle(Prop(listOf(0.0), listOf(Keyframe(0L, listOf(0.0)), Keyframe(sec * 2, listOf(0.0)))), setOf(0L, sec * 2), true, 0, 10.0, 5.0, sec / 30, 1L)
+        check("wiggler adds keyframes at the frequency", wig.keys.size > 2 && wig.keys.first().value[0] == 0.0 && wig.keys.last().value[0] == 0.0)
+        check("wiggler stays within the magnitude", wig.keys.all { Math.abs(it.value[0]) <= 10.0 + 1e-9 })
+        val sketch = withSketchedPath(Prop(listOf(0.0, 0.0), spatial = true), listOf(Pair(0L, listOf(0.0, 0.0)), Pair(sec, listOf(100.0, 50.0))), sec / 30, 0.0)
+        check("motion sketch makes one keyframe per frame", sketch.keys.size == 31 && nearD(sketch.keys[15].value[0], 50.0) && nearD(sketch.keys[15].value[1], 25.0))
         val withSmooth = after.withLayerProp(compId, layer.id, Path.OPACITY) {
             withKeySmooth(
                 Prop(

@@ -40,6 +40,7 @@ class LayerTimelineView(context: Context) : View(context) {
     var onTrim: ((Long, Int, Long) -> Unit)? = null
     var onKeySelect: ((Long, Boolean) -> Unit)? = null // layer time, true = toggle it, false = select only it
     var onKeysMove: ((Long) -> Unit)? = null // how far the selected keyframes moved, in ticks
+    var onKeysScale: ((Long, Double) -> Unit)? = null // anchor (layer time) and factor: the selected keyframes were stretched
 
     private val density = resources.displayMetrics.density
     private val rulerH = 22f * density
@@ -64,6 +65,9 @@ class LayerTimelineView(context: Context) : View(context) {
     private var keyHit = NO_KEY
     private var keyDragging = false
     private var keyDelta = 0L
+    private var keyScaling = false // long-press the first or last of 2 or more selected keyframes, then drag: scale in time
+    private var scaleAnchor = 0L
+    private var scaleFactor = 1.0
 
     private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private val rect = RectF()
@@ -131,6 +135,19 @@ class LayerTimelineView(context: Context) : View(context) {
                 performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                 invalidate()
             }
+        }
+    }
+
+    // like Alt-dragging the first or last selected keyframe in After Effects
+    private val keyScalePress = Runnable {
+        val mn = selKeys.minOrNull()
+        val mx = selKeys.maxOrNull()
+        if (keyHit != NO_KEY && !moved && selKeys.size >= 2 && mn != null && mx != null && (keyHit == mn || keyHit == mx)) {
+            keyScaling = true
+            scaleAnchor = if (keyHit == mn) mx else mn
+            scaleFactor = 1.0
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            invalidate()
         }
     }
 
@@ -297,10 +314,17 @@ class LayerTimelineView(context: Context) : View(context) {
                 for (key in prop.keys) {
                     val picked = isSel && key.time in selKeys
                     val dragShift = if (picked && keyDragging) keyDelta else 0L
-                    val kt = l.startTime + key.time + shift + dragShift
+                    var kt = l.startTime + key.time + shift + dragShift
+                    if (picked && keyScaling) kt = l.startTime + shift + scaleAnchor + Math.round((key.time - scaleAnchor) * scaleFactor)
                     if (kt < inP || kt > outP) continue
                     diamondPaint.color = if (picked) Color.parseColor("#FFD54A") else Color.WHITE
-                    drawDiamond(canvas, xOf(kt), rect.bottom - 7f * density, (if (picked) 6f else 4.5f) * density)
+                    val dr = (if (picked) 6f else 4.5f) * density
+                    if (key.rove) {
+                        // a roving keyframe is a circle (its time is worked out for you)
+                        canvas.drawCircle(xOf(kt), rect.bottom - 7f * density, dr * 0.9f, diamondPaint)
+                    } else {
+                        drawDiamond(canvas, xOf(kt), rect.bottom - 7f * density, dr)
+                    }
                 }
             }
             diamondPaint.color = Color.WHITE
@@ -374,6 +398,9 @@ class LayerTimelineView(context: Context) : View(context) {
                 keyHit = keyAt(e.x, e.y)
                 keyDragging = false
                 keyDelta = 0L
+                keyScaling = false
+                removeCallbacks(keyScalePress)
+                if (keyHit != NO_KEY) postDelayed(keyScalePress, ViewConfiguration.getLongPressTimeout().toLong())
                 if (keyHit == NO_KEY) {
                     val edge = edgeAt(e.x, e.y)
                     if (edge != 0 && c != null) {
@@ -397,6 +424,8 @@ class LayerTimelineView(context: Context) : View(context) {
                 keyHit = NO_KEY
                 keyDragging = false
                 keyDelta = 0L
+                keyScaling = false
+                removeCallbacks(keyScalePress)
                 lastY = e.y
                 invalidate()
             }
@@ -412,6 +441,8 @@ class LayerTimelineView(context: Context) : View(context) {
                     keyHit = NO_KEY
                     keyDragging = false
                     keyDelta = 0L
+                    keyScaling = false
+                    removeCallbacks(keyScalePress)
                     lastY = e.y
                 } else if (c != null) {
                     val dx = e.x - downX
@@ -437,7 +468,12 @@ class LayerTimelineView(context: Context) : View(context) {
                         }
                     } else if (keyHit != NO_KEY) {
                         removeCallbacks(longPress)
-                        if (moved) {
+                        if (keyScaling) {
+                            val denom = (keyHit - scaleAnchor).toDouble()
+                            if (denom != 0.0) scaleFactor = ((keyHit + ticksOfDx(dx) - scaleAnchor) / denom).coerceAtLeast(0.05)
+                            invalidate()
+                        } else if (moved) {
+                            removeCallbacks(keyScalePress)
                             if (!keyDragging) {
                                 keyDragging = true
                                 // dragging a keyframe that is not selected selects just that one
@@ -485,7 +521,16 @@ class LayerTimelineView(context: Context) : View(context) {
                     movingDelta = 0L
                     onMove?.invoke(id, d, row)
                     invalidate()
+                } else if (keyHit != NO_KEY && keyScaling) {
+                    val anchor = scaleAnchor
+                    val factor = scaleFactor
+                    keyHit = NO_KEY
+                    keyScaling = false
+                    removeCallbacks(keyScalePress)
+                    if (abs(factor - 1.0) > 0.001) onKeysScale?.invoke(anchor, factor)
+                    invalidate()
                 } else if (keyHit != NO_KEY) {
+                    removeCallbacks(keyScalePress)
                     val hit = keyHit
                     val d = keyDelta
                     val wasDragging = keyDragging
@@ -512,6 +557,8 @@ class LayerTimelineView(context: Context) : View(context) {
                 keyHit = NO_KEY
                 keyDragging = false
                 keyDelta = 0L
+                keyScaling = false
+                removeCallbacks(keyScalePress)
                 invalidate()
             }
         }

@@ -123,6 +123,7 @@ object ProjectJson {
             ko.put("pathType", k.pathType.name)
             ko.put("inTan", numsToJson(k.inTan))
             ko.put("outTan", numsToJson(k.outTan))
+            ko.put("rove", k.rove)
             ka.put(ko)
         }
         o.put("keys", ka)
@@ -242,7 +243,8 @@ object ProjectJson {
                         smoothOf(k.optString("smooth", "NONE")),
                         pathTypeOf(k.optString("pathType", "AUTO")),
                         readNums(k.optJSONArray("inTan")),
-                        readNums(k.optJSONArray("outTan"))
+                        readNums(k.optJSONArray("outTan")),
+                        k.optBoolean("rove", false)
                     )
                 )
             }
