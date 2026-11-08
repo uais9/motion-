@@ -43,6 +43,9 @@ class GraphEditorView(context: Context) : View(context) {
     companion object {
         private val PATHS = listOf(Path.POSITION, Path.SCALE, Path.ROTATION, Path.OPACITY, Path.ANCHOR)
         private val NAMES = listOf("Position", "Scale", "Rotation", "Opacity", "Anchor")
+        // with Separate Dimensions, Position is X Position and Y Position
+        private val SEP_PATHS = listOf(Path.POSITION_X, Path.POSITION_Y, Path.SCALE, Path.ROTATION, Path.OPACITY, Path.ANCHOR)
+        private val SEP_NAMES = listOf("X Pos", "Y Pos", "Scale", "Rotation", "Opacity", "Anchor")
         private val PRESETS = listOf(
             Preset("Linear", Interp.LINEAR, listOf(0.0, 0.0, 1.0, 1.0)),
             Preset("Easy Ease", Interp.BEZIER, listOf(0.3333, 0.0, 0.6667, 1.0)),
@@ -117,6 +120,23 @@ class GraphEditorView(context: Context) : View(context) {
         Color.parseColor("#6BB5FF")
     )
 
+    // the properties in the chips at the top: Position (or X and Y Position), Scale, Rotation, Opacity, Anchor,
+    // and for a shape layer also Size, Roundness and Stroke Width
+    private fun layerPaths(l: Layer?): Pair<List<String>, List<String>> {
+        val separated = l != null && l.props.containsKey(Path.POSITION_X)
+        var p = if (separated) SEP_PATHS else PATHS
+        var n = if (separated) SEP_NAMES else NAMES
+        if (l != null && l.kind == LayerKind.SHAPE) {
+            p = p + listOf(Path.SHAPE_SIZE, Path.SHAPE_ROUND, Path.STROKE_WIDTH)
+            n = n.map { if (it == "Position") "Pos" else if (it == "Rotation") "Rot" else if (it == "Opacity") "Opac" else it } +
+                listOf("Size", "Round", "Stroke")
+        }
+        return Pair(p, n)
+    }
+
+    private var paths: List<String> = PATHS
+    private var names: List<String> = NAMES
+
     fun setData(l: Layer?, lt: Long) {
         val id = l?.id ?: -1L
         if (id != lastLayerId) {
@@ -126,9 +146,13 @@ class GraphEditorView(context: Context) : View(context) {
         }
         layer = l
         layerTime = lt
+        val lp = layerPaths(l)
+        paths = lp.first
+        names = lp.second
+        if (selPath !in paths) selPath = paths[0]
         // show an animated property by default, so the graph is not empty
         if (l != null && !userChose && l.props[selPath]?.animated != true) {
-            for (pth in PATHS) {
+            for (pth in paths) {
                 if (l.props[pth]?.animated == true) {
                     selPath = pth
                     userSeg = -1
@@ -166,7 +190,7 @@ class GraphEditorView(context: Context) : View(context) {
         return RectF(x0 + 1.5f * density, top, x0 + w - 1.5f * density, top + chipH)
     }
 
-    private fun topChip(i: Int): RectF = chipRect(i, PATHS.size, 2f * density)
+    private fun topChip(i: Int): RectF = chipRect(i, paths.size, 2f * density)
 
     private fun bottomChip(i: Int): RectF = chipRect(i, PRESETS.size, height - chipH - 2f * density)
 
@@ -365,9 +389,9 @@ class GraphEditorView(context: Context) : View(context) {
             return
         }
 
-        for (i in PATHS.indices) {
-            val animated = l.props[PATHS[i]]?.animated == true
-            drawChip(canvas, topChip(i), NAMES[i], PATHS[i] == selPath, animated)
+        for (i in paths.indices) {
+            val animated = l.props[paths[i]]?.animated == true
+            drawChip(canvas, topChip(i), names[i], paths[i] == selPath, animated)
         }
 
         val p = currentProp()
@@ -993,7 +1017,7 @@ class GraphEditorView(context: Context) : View(context) {
         target = 0
         targetIndex = -1
         val l = layer ?: return
-        for (i in PATHS.indices) {
+        for (i in paths.indices) {
             if (topChip(i).contains(x, y)) {
                 target = 1
                 targetIndex = i
@@ -1137,7 +1161,7 @@ class GraphEditorView(context: Context) : View(context) {
     private fun tap(x: Float) {
         when (target) {
             1 -> {
-                selPath = PATHS[targetIndex]
+                selPath = paths[targetIndex]
                 userSeg = -1
                 userChose = true
                 applyAutoType()

@@ -4,6 +4,12 @@ enum class FootageKind { VIDEO, IMAGE }
 
 enum class Interp { LINEAR, HOLD, BEZIER }
 
+// What a layer is. FOOTAGE shows a video or an image; SOLID is a flat colour; NULL is an invisible layer to parent
+// other layers to; SHAPE draws a rectangle or an ellipse.
+enum class LayerKind { FOOTAGE, SOLID, NULL, SHAPE }
+
+enum class ShapeType { RECT, ELLIPSE }
+
 // How a keyframe's two handles are managed (After Effects' Bezier, Auto Bezier, Continuous Bezier):
 //  NONE       independent handles (plain Bezier)
 //  AUTO       the handles are worked out automatically, so speed is smooth through the keyframe
@@ -59,9 +65,16 @@ data class Footage(
 object Path {
     const val ANCHOR = "transform/anchorPoint"
     const val POSITION = "transform/position"
+    // with Separate Dimensions, Position is replaced by these two (one number each)
+    const val POSITION_X = "transform/positionX"
+    const val POSITION_Y = "transform/positionY"
     const val SCALE = "transform/scale"
     const val ROTATION = "transform/rotation"
     const val OPACITY = "transform/opacity"
+    // shape layers (rectangle and ellipse)
+    const val SHAPE_SIZE = "shape/size"
+    const val SHAPE_ROUND = "shape/roundness"
+    const val STROKE_WIDTH = "shape/strokeWidth"
 }
 
 // A layer in a composition.
@@ -75,7 +88,16 @@ data class Layer(
     val inPoint: Long,
     val outPoint: Long,
     val props: Map<String, Prop>,
-    val enabled: Boolean = true
+    val enabled: Boolean = true,
+    val kind: LayerKind = LayerKind.FOOTAGE,
+    val parentId: Long = -1L, // id of the parent layer in the same composition, -1 = none
+    val w: Int = 0, // size in pixels of a solid or a null
+    val h: Int = 0,
+    val fill: Int = 0xFFFFFFFF.toInt(), // colour of a solid, fill colour of a shape (ARGB)
+    val stroke: Int = 0xFFFFFFFF.toInt(), // stroke colour of a shape
+    val hasFill: Boolean = true,
+    val hasStroke: Boolean = false,
+    val shapeType: ShapeType = ShapeType.RECT
 )
 
 // A composition. layers[0] is the TOP layer.

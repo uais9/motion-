@@ -147,8 +147,9 @@ fun Project.withLayerSplit(compId: Long, layerId: Long, t: Long): Project {
     )
 }
 
+// Deleting a layer lets go of its children (they lose their parent).
 fun Project.withLayerRemoved(compId: Long, layerId: Long): Project = mapComp(compId) { c ->
-    c.copy(layers = c.layers.filter { it.id != layerId })
+    c.copy(layers = c.layers.filter { it.id != layerId }.map { if (it.parentId == layerId) it.copy(parentId = -1L) else it })
 }
 
 fun Project.withLayerEnabled(compId: Long, layerId: Long, enabled: Boolean): Project =

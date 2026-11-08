@@ -33,6 +33,7 @@ class LayerTimelineView(context: Context) : View(context) {
     private var playhead = 0L
     private var selectedId = -1L
     private var selKeys: Set<Long> = emptySet() // layer times of the selected keyframes (selected layer)
+    private var multiIds: Set<Long> = emptySet() // layers selected together (multi-select), for Sequence Layers and parenting
 
     var onScrub: ((Long) -> Unit)? = null
     var onSelect: ((Long) -> Unit)? = null
@@ -151,8 +152,9 @@ class LayerTimelineView(context: Context) : View(context) {
         }
     }
 
-    fun setData(p: Project, c: Comp?, t: Long, selected: Long, keys: Set<Long> = emptySet()) {
+    fun setData(p: Project, c: Comp?, t: Long, selected: Long, keys: Set<Long> = emptySet(), multi: Set<Long> = emptySet()) {
         project = p
+        multiIds = multi
         comp = c
         playhead = t
         selectedId = selected
@@ -293,6 +295,9 @@ class LayerTimelineView(context: Context) : View(context) {
             val f = project.footage.firstOrNull { it.id == l.footageId }
             barPaint.color = when {
                 !l.enabled -> Color.parseColor("#4A4F5C")
+                l.kind == LayerKind.SOLID -> darker(l.fill)
+                l.kind == LayerKind.NULL -> Color.parseColor("#8E5BD0")
+                l.kind == LayerKind.SHAPE -> Color.parseColor("#D9822B")
                 f != null && f.kind == FootageKind.IMAGE -> Color.parseColor("#2F9E6D")
                 else -> Color.parseColor("#3B5BDB")
             }
@@ -329,6 +334,10 @@ class LayerTimelineView(context: Context) : View(context) {
             }
             diamondPaint.color = Color.WHITE
 
+            if (l.id in multiIds && l.id != movingId) {
+                borderPaint.color = Color.parseColor("#FFB04A")
+                canvas.drawRoundRect(rect, 5f * density, 5f * density, borderPaint)
+            }
             if (l.id == movingId) {
                 borderPaint.color = Color.YELLOW
                 canvas.drawRoundRect(rect, 5f * density, 5f * density, borderPaint)
@@ -367,6 +376,10 @@ class LayerTimelineView(context: Context) : View(context) {
         canvas.drawLine(cx, 0f, cx, h, headPaint)
         canvas.drawCircle(cx, 4f * density, 4f * density, headPaint)
     }
+
+    // a solid's bar is its colour, a bit darker so the name can be read
+    private fun darker(argb: Int): Int =
+        Color.rgb(((argb shr 16) and 255) * 3 / 4, ((argb shr 8) and 255) * 3 / 4, (argb and 255) * 3 / 4)
 
     private fun drawDiamond(canvas: Canvas, x: Float, y: Float, r: Float) {
         diamond.reset()

@@ -3,6 +3,9 @@ package com.motion
 import android.app.Activity
 import android.content.ContentValues
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -27,19 +30,24 @@ import androidx.media3.transformer.Transformer
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.concurrent.thread
+import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.math.min
 
 // Exports the composition to an MP4 with Media3 Transformer.
-//  - a solid picture in the composition's background colour runs for the whole duration (the base)
-//  - every visible layer is its own sequence, stacked on top in layer order
-//  - each layer's frames are moved by its transform (anchor, position, scale, rotation) through a
-//    MatrixTransformation that reads the same layerMatrix() the preview uses, so keyframes animate
-//  - opacity (and its keyframes) is applied by the compositor
+// - a solid picture in the composition's background colour runs for the whole duration (the base)
+// - every visible layer is its own sequence, stacked on top in layer order
+// - each layer's frames are moved by its transform (anchor, position, scale, rotation, and its parents)
+//   through a MatrixTransformation that reads the same worldMatrix() the preview uses, so keyframes animate
+// - opacity (and its keyframes) is applied by the compositor
+// - footage layers use their video or image. A solid is exported as a flat picture, a shape layer as a picture
+//   of the shape at its first frame (its transform still animates, its size and stroke do not yet).
+//   Null objects show nothing, so they are left out.
 @OptIn(UnstableApi::class)
 class Exporter(private val activity: Activity) {
+
     private val progressHolder = ProgressHolder()
     private var transformer: Transformer? = null
-
     var running = false
         private set
 
@@ -47,7 +55,7 @@ class Exporter(private val activity: Activity) {
         val tr = transformer ?: return "Exporting..."
         val state = tr.getProgress(progressHolder)
         return if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-            "Exporting... ${progressHolder.progress}%  (keep the app open)"
+            "Exporting... ${progressHolder.progress}% (keep the app open)"
         } else {
             "Exporting..."
         }
@@ -71,13 +79,17 @@ class Exporter(private val activity: Activity) {
         return b.build()
     }
 
+    // A layer that is exported as a picture: its footage (a real one, or one made for a solid or a shape)
+    // and where the layer's own origin sits inside that picture.
+    private class Source(val footage: Footage, val originX: Double, val originY: Double)
+
     // The layer's transform, written for the frame's own coordinates (x and y from -1 to 1).
     // itemUs is the time since the layer's first visible frame.
-    private fun matrixAt(l: Layer, f: Footage, w: Int, h: Int, itemUs: Long): android.graphics.Matrix {
+    private fun matrixAt(layers: List<Layer>, l: Layer, src: Source, w: Int, h: Int, itemUs: Long): android.graphics.Matrix {
         val compTime = l.inPoint + itemUs * TICKS_PER_US
-        val m = layerMatrix(l, compTime)
-        val fw = max(f.width, 1).toDouble()
-        val fh = max(f.height, 1).toDouble()
+        val m = worldMatrix(layers, l, compTime).times(Affine.translate(-src.originX, -src.originY))
+        val fw = max(src.footage.width, 1).toDouble()
+        val fh = max(src.footage.height, 1).toDouble()
         // frame coordinates (-1..1) -> the layer's own pixels
         val toPixels = Affine(fw / 2.0, 0.0, 0.0, -fh / 2.0, fw / 2.0, fh / 2.0)
         // composition pixels -> frame coordinates (-1..1)
@@ -94,13 +106,14 @@ class Exporter(private val activity: Activity) {
         return out
     }
 
-    private fun layerItem(l: Layer, f: Footage, w: Int, h: Int, fps: Int): EditedMediaItem? {
+    private fun layerItem(layers: List<Layer>, l: Layer, src: Source, w: Int, h: Int, fps: Int): EditedMediaItem? {
+        val f = src.footage
         val uri = Uri.parse(f.uri)
         val effects = Effects(
             emptyList(),
             listOf<Effect>(
                 Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_STRETCH_TO_FIT),
-                MatrixTransformation { us -> matrixAt(l, f, w, h, us) }
+                MatrixTransformation { us -> matrixAt(layers, l, src, w, h, us) }
             )
         )
         if (f.kind == FootageKind.VIDEO) {
@@ -119,7 +132,7 @@ class Exporter(private val activity: Activity) {
         }
         val durationUs = ticksToUs(l.outPoint - l.inPoint)
         if (durationUs <= 0L) return null
-        val mime = activity.contentResolver.getType(uri) ?: "image/jpeg"
+        val mime = if (f.id < 0L) "image/png" else (activity.contentResolver.getType(uri) ?: "image/jpeg")
         val mi = MediaItem.Builder().setUri(uri).setMimeType(mime).build()
         return EditedMediaItem.Builder(mi)
             .setDurationUs(durationUs)
@@ -128,13 +141,68 @@ class Exporter(private val activity: Activity) {
             .build()
     }
 
+    // A solid: a small flat picture, stretched to the solid's size by the layer's transform.
+    private fun solidSource(l: Layer): Source? {
+        if (l.w <= 0 || l.h <= 0) return null
+        val file = File(activity.cacheDir, "solid_" + Integer.toHexString(l.fill) + ".png")
+        if (!file.exists()) {
+            val bmp = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
+            bmp.eraseColor(l.fill)
+            FileOutputStream(file).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        }
+        val f = Footage(-1L, l.name, Uri.fromFile(file).toString(), FootageKind.IMAGE, l.w, l.h, 0L)
+        return Source(f, 0.0, 0.0)
+    }
+
+    // A shape layer: a picture of the shape as it is on the layer's first frame. The layer's origin is the
+    // middle of the shape, which is the middle of the picture.
+    private fun shapeSource(l: Layer): Source? {
+        val lt = l.inPoint - l.startTime
+        val size = Eval.layerValue(l, Path.SHAPE_SIZE, lt)
+        val sw = if (l.hasStroke) Eval.layerValue(l, Path.STROKE_WIDTH, lt).getOrElse(0) { 0.0 } else 0.0
+        val round = Eval.layerValue(l, Path.SHAPE_ROUND, lt).getOrElse(0) { 0.0 }
+        val shapeW = size.getOrElse(0) { 0.0 }
+        val shapeH = size.getOrElse(1) { 0.0 }
+        if (shapeW <= 0.0 || shapeH <= 0.0) return null
+        val bw = min(4096, ceil(shapeW + sw).toInt() + 4)
+        val bh = min(4096, ceil(shapeH + sw).toInt() + 4)
+        val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val box = RectF(
+            (bw - shapeW).toFloat() / 2f, (bh - shapeH).toFloat() / 2f,
+            (bw + shapeW).toFloat() / 2f, (bh + shapeH).toFloat() / 2f
+        )
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val r = min(round, min(shapeW, shapeH) / 2.0).toFloat()
+        fun draw() {
+            if (l.shapeType == ShapeType.ELLIPSE) canvas.drawOval(box, paint)
+            else if (r > 0.5f) canvas.drawRoundRect(box, r, r, paint)
+            else canvas.drawRect(box, paint)
+        }
+        if (l.hasFill) {
+            paint.style = Paint.Style.FILL
+            paint.color = l.fill
+            draw()
+        }
+        if (l.hasStroke && sw > 0.0) {
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = sw.toFloat()
+            paint.color = l.stroke
+            draw()
+        }
+        val file = File(activity.cacheDir, "shape_" + l.id + "_" + System.currentTimeMillis() + ".png")
+        FileOutputStream(file).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        val f = Footage(-1L, l.name, Uri.fromFile(file).toString(), FootageKind.IMAGE, bw, bh, 0L)
+        return Source(f, bw / 2.0, bh / 2.0)
+    }
+
     // Writes an error and the exceptions behind it, so we can see the real cause.
     private fun describe(e: Throwable?): String {
         var s = ""
         var c: Throwable? = e
         var n = 0
         while (c != null && n < 4) {
-            if (s.isNotEmpty()) s += "  <-  "
+            if (s.isNotEmpty()) s += " <- "
             s += c.javaClass.simpleName + ": " + (c.message ?: "")
             c = c.cause
             n++
@@ -159,8 +227,8 @@ class Exporter(private val activity: Activity) {
             val w = comp.width and 1.inv()
             val h = comp.height and 1.inv()
             val fps = Math.round(comp.frameRate.fps).toInt().coerceIn(1, 60)
-
             val sequences = ArrayList<EditedMediaItemSequence>()
+
             if (useBase) {
                 val baseFile = File(activity.cacheDir, "base_background.png")
                 val bmp = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
@@ -188,8 +256,17 @@ class Exporter(private val activity: Activity) {
             val used = ArrayList<Layer>()
             // bottom layer first, so the top layer ends up on top
             for (l in comp.layers.filter { it.enabled }.reversed()) {
-                val f = project.footage.firstOrNull { it.id == l.footageId } ?: continue
-                val item = layerItem(l, f, w, h, fps) ?: continue
+                val src: Source? = when (l.kind) {
+                    LayerKind.FOOTAGE -> {
+                        val f = project.footage.firstOrNull { it.id == l.footageId }
+                        if (f == null) null else Source(f, 0.0, 0.0)
+                    }
+                    LayerKind.SOLID -> solidSource(l)
+                    LayerKind.SHAPE -> shapeSource(l)
+                    LayerKind.NULL -> null // shows nothing
+                }
+                if (src == null) continue
+                val item = layerItem(comp.layers, l, src, w, h, fps) ?: continue
                 sequences.add(seqOf(item, ticksToUs(l.inPoint)))
                 used.add(l)
             }
@@ -224,7 +301,6 @@ class Exporter(private val activity: Activity) {
                 })
             }
             val composition = builder.build()
-
             val out = File(activity.cacheDir, "export_" + System.currentTimeMillis() + ".mp4")
             if (out.exists()) out.delete()
 
@@ -244,7 +320,7 @@ class Exporter(private val activity: Activity) {
                                 if (where.isEmpty()) {
                                     onFinished("Export finished but saving failed", false)
                                 } else {
-                                    val note = if (useBase) "" else "  (this time without the background base)"
+                                    val note = if (useBase) "" else " (this time without the background base)"
                                     onFinished("Saved to $where$note", true)
                                 }
                             }

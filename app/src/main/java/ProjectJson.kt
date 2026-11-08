@@ -102,6 +102,15 @@ object ProjectJson {
         o.put("inPoint", l.inPoint)
         o.put("outPoint", l.outPoint)
         o.put("enabled", l.enabled)
+        o.put("kind", l.kind.name)
+        o.put("parentId", l.parentId)
+        o.put("w", l.w)
+        o.put("h", l.h)
+        o.put("fill", l.fill)
+        o.put("stroke", l.stroke)
+        o.put("hasFill", l.hasFill)
+        o.put("hasStroke", l.hasStroke)
+        o.put("shapeType", l.shapeType.name)
         val po = JSONObject()
         for ((path, prop) in l.props) po.put(path, propToJson(prop))
         o.put("props", po)
@@ -174,6 +183,14 @@ object ProjectJson {
         }
     }
 
+    private inline fun <reified E : Enum<E>> enumOr(name: String, def: E): E {
+        return try {
+            java.lang.Enum.valueOf(E::class.java, name)
+        } catch (e: Exception) {
+            def
+        }
+    }
+
     private fun footageFromJson(o: JSONObject): Footage {
         return Footage(
             o.getLong("id"),
@@ -223,7 +240,16 @@ object ProjectJson {
             inPoint = o.optLong("inPoint", 0L),
             outPoint = o.optLong("outPoint", 0L),
             props = props,
-            enabled = o.optBoolean("enabled", true)
+            enabled = o.optBoolean("enabled", true),
+            kind = enumOr(o.optString("kind", "FOOTAGE"), LayerKind.FOOTAGE),
+            parentId = o.optLong("parentId", -1L),
+            w = o.optInt("w", 0),
+            h = o.optInt("h", 0),
+            fill = o.optInt("fill", 0xFFFFFFFF.toInt()),
+            stroke = o.optInt("stroke", 0xFFFFFFFF.toInt()),
+            hasFill = o.optBoolean("hasFill", true),
+            hasStroke = o.optBoolean("hasStroke", false),
+            shapeType = enumOr(o.optString("shapeType", "RECT"), ShapeType.RECT)
         )
     }
 

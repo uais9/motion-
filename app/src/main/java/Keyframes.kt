@@ -904,6 +904,47 @@ fun withSketchedPath(prop: Prop, samples: List<Pair<Long, List<Double>>>, tpf: L
     return if (smoothing > 0.0) withSmoothed(result, made.map { it.time }.toSet(), smoothing, true) else result
 }
 
+// ---------- Separate Dimensions ----------
+
+// Animation > Separate Dimensions: Position becomes X Position and Y Position, each with its own keyframes,
+// speed and curves. Like After Effects, the motion path (spatial interpolation) is gone, and the temporal
+// interpolation stays. Turning it off puts them back together, with a keyframe wherever either had one.
+fun Project.withSeparatedDimensions(compId: Long, layerId: Long, separate: Boolean): Project = mapComp(compId) { c ->
+    c.copy(layers = c.layers.map { l ->
+        if (l.id != layerId) {
+            l
+        } else if (separate && l.props.containsKey(Path.POSITION)) {
+            val pos = l.props.getValue(Path.POSITION)
+            fun part(d: Int): Prop = Prop(
+                listOf(pos.value.getOrElse(d) { 0.0 }),
+                pos.keys.map { k ->
+                    k.copy(
+                        value = listOf(k.value.getOrElse(d) { 0.0 }),
+                        rove = false, pathType = PathType.AUTO, inTan = emptyList(), outTan = emptyList()
+                    )
+                }
+            )
+            l.copy(props = (l.props - Path.POSITION) + (Path.POSITION_X to part(0)) + (Path.POSITION_Y to part(1)))
+        } else if (!separate && l.props.containsKey(Path.POSITION_X) && l.props.containsKey(Path.POSITION_Y)) {
+            val xp = l.props.getValue(Path.POSITION_X)
+            val yp = l.props.getValue(Path.POSITION_Y)
+            val times = (xp.keys.map { it.time } + yp.keys.map { it.time }).toSortedSet()
+            val keys = times.map { t ->
+                val src = xp.keys.firstOrNull { it.time == t } ?: yp.keys.first { it.time == t }
+                Keyframe(
+                    t,
+                    listOf(Eval.valueAt(xp, t).getOrElse(0) { 0.0 }, Eval.valueAt(yp, t).getOrElse(0) { 0.0 }),
+                    src.interp, src.ease
+                )
+            }
+            val position = Prop(listOf(xp.value.getOrElse(0) { 0.0 }, yp.value.getOrElse(0) { 0.0 }), keys, spatial = true)
+            l.copy(props = (l.props - Path.POSITION_X - Path.POSITION_Y) + (Path.POSITION to position))
+        } else {
+            l
+        }
+    })
+}
+
 // ---------- graph editor ----------
 
 // Sets how the segment that starts at keyframe `index` moves to the next keyframe.
@@ -1119,6 +1160,18 @@ object KeyframeTest {
         check("wiggler stays within the magnitude", wig.keys.all { Math.abs(it.value[0]) <= 10.0 + 1e-9 })
         val sketch = withSketchedPath(Prop(listOf(0.0, 0.0), spatial = true), listOf(Pair(0L, listOf(0.0, 0.0)), Pair(sec, listOf(100.0, 50.0))), sec / 30, 0.0)
         check("motion sketch makes one keyframe per frame", sketch.keys.size == 31 && nearD(sketch.keys[15].value[0], 50.0) && nearD(sketch.keys[15].value[1], 25.0))
+        // Separate Dimensions
+        val animPos = after.withLayerProp(compId, layer.id, Path.POSITION) {
+            Prop(listOf(0.0, 0.0), listOf(Keyframe(0L, listOf(0.0, 0.0)), Keyframe(sec, listOf(100.0, 50.0))), spatial = true)
+        }
+        val sepP = animPos.withSeparatedDimensions(compId, layer.id, true)
+        val sepL = sepP.comps[0].layers[0]
+        check("separate dimensions: X and Y Position replace Position", sepL.props.containsKey(Path.POSITION_X) && sepL.props.containsKey(Path.POSITION_Y) && !sepL.props.containsKey(Path.POSITION))
+        check("each one has its own keyframes", sepL.props[Path.POSITION_X]!!.keys.map { it.value[0] } == listOf(0.0, 100.0) && sepL.props[Path.POSITION_Y]!!.keys.map { it.value[0] } == listOf(0.0, 50.0))
+        check("the layer still reads Position as x and y", Eval.layerValue(sepL, Path.POSITION, sec / 2) == listOf(50.0, 25.0))
+        val backL = sepP.withSeparatedDimensions(compId, layer.id, false).comps[0].layers[0]
+        check("turning it off puts Position back together", backL.props[Path.POSITION]!!.keys.map { it.value } == listOf(listOf(0.0, 0.0), listOf(100.0, 50.0)) && backL.props[Path.POSITION]!!.spatial && !backL.props.containsKey(Path.POSITION_X))
+        check("separated dimensions survive save and load", ProjectJson.decode(ProjectJson.encode(sepP)).project == sepP)
         val withSmooth = after.withLayerProp(compId, layer.id, Path.OPACITY) {
             withKeySmooth(
                 Prop(

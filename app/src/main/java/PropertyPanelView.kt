@@ -15,10 +15,11 @@ import kotlin.math.max
 import kotlin.math.min
 
 // The property panel for the selected layer, one row per property.
-//  - stopwatch: turn animation (keyframes) on or off
-//  - drag a value sideways: change it (drag away up or down for fine control)
-//  - tap a value: type an exact number.  Long-press a value: reset it
-//  - diamond: add or delete a keyframe at the playhead (animated properties only)
+// - stopwatch: turn animation (keyframes) on or off
+// - drag a value sideways: change it (drag away up or down for fine control)
+// - tap a value: type an exact number. Long-press a value: reset it
+// - diamond: add or delete a keyframe at the playhead (animated properties only)
+// With Separate Dimensions, the Position row becomes two rows: X Position and Y Position.
 class PropertyPanelView(context: Context) : View(context) {
 
     private class Row(
@@ -39,7 +40,31 @@ class PropertyPanelView(context: Context) : View(context) {
             Row(Path.ANCHOR, "Anchor", 2, 4.0, null, null)
         )
 
-        fun labelOf(path: String): String = ROWS.firstOrNull { it.path == path }?.label ?: path
+        // the same rows, with Position split in two
+        private val SEP_ROWS = listOf(
+            Row(Path.POSITION_X, "X Position", 1, 4.0, null, null),
+            Row(Path.POSITION_Y, "Y Position", 1, 4.0, null, null),
+            Row(Path.SCALE, "Scale", 2, 0.8, null, null),
+            Row(Path.ROTATION, "Rotation", 1, 0.8, null, null),
+            Row(Path.OPACITY, "Opacity", 1, 0.5, 0.0, 100.0),
+            Row(Path.ANCHOR, "Anchor", 2, 4.0, null, null)
+        )
+
+        // a shape layer also has these (Roundness only for a rectangle)
+        private val SHAPE_SIZE_ROW = Row(Path.SHAPE_SIZE, "Size", 2, 2.0, 0.0, null)
+        private val SHAPE_ROUND_ROW = Row(Path.SHAPE_ROUND, "Roundness", 1, 1.0, 0.0, null)
+        private val SHAPE_STROKE_ROW = Row(Path.STROKE_WIDTH, "Stroke Width", 1, 0.5, 0.0, null)
+
+        fun labelOf(path: String): String =
+            (ROWS + SEP_ROWS + listOf(SHAPE_SIZE_ROW, SHAPE_ROUND_ROW, SHAPE_STROKE_ROW)).firstOrNull { it.path == path }?.label ?: path
+
+        private fun rowsFor(l: Layer?): List<Row> {
+            var r = if (l != null && l.props.containsKey(Path.POSITION_X)) SEP_ROWS else ROWS
+            if (l != null && l.kind == LayerKind.SHAPE) {
+                r = r + SHAPE_SIZE_ROW + (if (l.shapeType == ShapeType.RECT) listOf(SHAPE_ROUND_ROW) else emptyList()) + SHAPE_STROKE_ROW
+            }
+            return r
+        }
     }
 
     var onScrubStart: (() -> Unit)? = null
@@ -52,9 +77,26 @@ class PropertyPanelView(context: Context) : View(context) {
 
     private var layer: Layer? = null
     private var layerTime = 0L
-
+    private var rows: List<Row> = ROWS
     private val density = resources.displayMetrics.density
-    private val rowH = 34f * density
+
+    // 34dp per row, squeezed a little when there are 6 rows so they fit (never below 26dp: more rows scroll)
+    private val rowH: Float
+        get() {
+            val full = 34f * density
+            return if (height > 0) max(26f * density, min(full, (height - 8f * density) / rows.size)) else full
+        }
+
+    // the panel scrolls up and down when the rows do not fit (a shape layer has 8)
+    private var scrollY = 0f
+    private var scrolling = false
+    private var lastY = 0f
+
+    private fun clampScroll() {
+        val content = 8f * density + rows.size * rowH
+        scrollY = scrollY.coerceIn(0f, max(0f, content - height))
+    }
+
     private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
     private var activeRow = -1
@@ -81,20 +123,21 @@ class PropertyPanelView(context: Context) : View(context) {
     fun setData(l: Layer?, lt: Long, @Suppress("UNUSED_PARAMETER") defaults: Map<String, List<Double>>) {
         layer = l
         layerTime = lt
+        rows = rowsFor(l)
         invalidate()
     }
 
     private val longPress = Runnable {
-        if (activeKind == 2 && !scrubbing && activeRow >= 0) {
+        if (activeKind == 2 && !scrubbing && activeRow >= 0 && activeRow < rows.size) {
             longFired = true
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-            onReset?.invoke(ROWS[activeRow].path)
+            onReset?.invoke(rows[activeRow].path)
         }
     }
 
     // ---------- layout ----------
 
-    private fun rowTop(i: Int): Float = 4f * density + i * rowH
+    private fun rowTop(i: Int): Float = 4f * density + i * rowH - scrollY
 
     private fun watchRect(i: Int): RectF =
         RectF(6f * density, rowTop(i), 42f * density, rowTop(i) + rowH)
@@ -111,7 +154,7 @@ class PropertyPanelView(context: Context) : View(context) {
         activeRow = -1
         activeKind = 0
         activeDim = 0
-        for (i in ROWS.indices) {
+        for (i in rows.indices) {
             if (watchRect(i).contains(x, y)) {
                 activeRow = i
                 activeKind = 1
@@ -122,7 +165,7 @@ class PropertyPanelView(context: Context) : View(context) {
                 activeKind = 3
                 return
             }
-            for (d in 0 until ROWS[i].dims) {
+            for (d in 0 until rows[i].dims) {
                 if (cellRect(i, d).contains(x, y)) {
                     activeRow = i
                     activeKind = 2
@@ -162,15 +205,17 @@ class PropertyPanelView(context: Context) : View(context) {
             canvas.drawText("Tap a layer bar to edit its properties", 12f * density, 30f * density, textPaint)
             return
         }
+        clampScroll()
         val blue = Color.parseColor("#4C8DFF")
-        for (i in ROWS.indices) {
-            val row = ROWS[i]
+        val rh = rowH
+        for (i in rows.indices) {
+            val row = rows[i]
             val prop = l.props[row.path]
             val animated = prop != null && prop.animated
             val hasKey = prop != null && prop.keys.any { it.time == layerTime }
             val vals = Eval.layerValue(l, row.path, layerTime)
             val top = rowTop(i)
-            val baseline = top + rowH * 0.64f
+            val baseline = top + rh * 0.64f
 
             val wr = watchRect(i)
             val wx = wr.centerX()
@@ -212,16 +257,32 @@ class PropertyPanelView(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
                 downX = e.x
                 downY = e.y
+                lastY = e.y
+                scrolling = false
                 scrubbing = false
                 longFired = false
                 hit(e.x, e.y)
                 if (l != null && activeKind == 2 && activeRow >= 0) {
-                    startValue = Eval.layerValue(l, ROWS[activeRow].path, layerTime)
+                    startValue = Eval.layerValue(l, rows[activeRow].path, layerTime)
                     postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
                 }
                 invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
+                if (!scrubbing && !scrolling && !longFired && abs(e.y - downY) > slop && abs(e.y - downY) > abs(e.x - downX) &&
+                    8f * density + rows.size * rowH > height
+                ) {
+                    scrolling = true
+                    removeCallbacks(longPress)
+                }
+                if (scrolling) {
+                    scrollY -= (e.y - lastY)
+                    clampScroll()
+                    lastY = e.y
+                    invalidate()
+                    return true
+                }
+                lastY = e.y
                 if (l != null && activeKind == 2 && activeRow >= 0 && !longFired) {
                     val dx = e.x - downX
                     val dy = e.y - downY
@@ -231,7 +292,7 @@ class PropertyPanelView(context: Context) : View(context) {
                         onScrubStart?.invoke()
                     }
                     if (scrubbing && startValue.isNotEmpty()) {
-                        val row = ROWS[activeRow]
+                        val row = rows[activeRow]
                         val fine = abs(dy) > 48f * density
                         val factor = if (fine) 0.1 else 1.0
                         var v = startValue.getOrElse(activeDim) { 0.0 } +
@@ -251,8 +312,8 @@ class PropertyPanelView(context: Context) : View(context) {
                 removeCallbacks(longPress)
                 if (scrubbing) {
                     onScrubEnd?.invoke()
-                } else if (!longFired && activeRow >= 0) {
-                    val path = ROWS[activeRow].path
+                } else if (!longFired && activeRow >= 0 && activeRow < rows.size) {
+                    val path = rows[activeRow].path
                     val moved = abs(e.x - downX) > slop || abs(e.y - downY) > slop
                     if (!moved) {
                         when (activeKind) {
@@ -263,6 +324,7 @@ class PropertyPanelView(context: Context) : View(context) {
                     }
                 }
                 scrubbing = false
+                scrolling = false
                 activeRow = -1
                 activeKind = 0
                 invalidate()
@@ -271,6 +333,7 @@ class PropertyPanelView(context: Context) : View(context) {
                 removeCallbacks(longPress)
                 if (scrubbing) onScrubEnd?.invoke()
                 scrubbing = false
+                scrolling = false
                 activeRow = -1
                 activeKind = 0
                 invalidate()

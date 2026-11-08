@@ -22,9 +22,13 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.concurrent.thread
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 // The preview. Draws the composition with OpenGL: the background, then each layer from the
 // bottom to the top. A layer is a quad in its own pixels, moved into composition pixels by
@@ -65,6 +69,19 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         val stMatrix = FloatArray(16)
     }
 
+    // a rectangle or an ellipse, in the layer's own pixels, centred on 0, 0
+    private class ShapeDraw(
+        val ellipse: Boolean,
+        val w: Float,
+        val h: Float,
+        val round: Float,
+        val strokeW: Float,
+        val fill: Int,
+        val stroke: Int,
+        val hasFill: Boolean,
+        val hasStroke: Boolean
+    )
+
     private class DrawLayer(
         val kind: FootageKind,
         val footageId: Long,
@@ -73,7 +90,10 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         val h: Int,
         val m: Affine,
         val opacity: Float,
-        val selected: Boolean
+        val selected: Boolean,
+        val lk: LayerKind = LayerKind.FOOTAGE,
+        val color: Int = 0, // solid colour (ARGB)
+        val shape: ShapeDraw? = null
     )
 
     private class Scene(
@@ -95,7 +115,9 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         val seg: Int, // the segment the playhead is in: its two keyframes are white and show handles
         val handles: List<PathHandle>,
         val nowX: Float,
-        val nowY: Float
+        val nowY: Float,
+        val keysLocal: FloatArray, // the keyframe positions as the layer stores them (before the parent's space)
+        val inv: Affine // from composition pixels back to the space the layer's values are written in
     )
 
     private val OES = GLES11Ext.GL_TEXTURE_EXTERNAL_OES
@@ -206,19 +228,35 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         for (i in c.layers.indices.reversed()) {
             val l = c.layers[i]
             if (!Eval.isActive(l, t)) continue
-            val f = p.footage.firstOrNull { it.id == l.footageId } ?: continue
-            var slot = -1
-            if (f.kind == FootageKind.VIDEO) {
-                slot = slotOf[l.id] ?: -1
+            // the layer's transform, with all its parents
+            val wm = worldMatrix(c.layers, l, t)
+            val opacity = layerOpacity(l, t).toFloat()
+            val sel = l.id == selectedId
+            if (l.kind == LayerKind.FOOTAGE) {
+                val f = p.footage.firstOrNull { it.id == l.footageId } ?: continue
+                var slot = -1
+                if (f.kind == FootageKind.VIDEO) {
+                    slot = slotOf[l.id] ?: -1
+                } else {
+                    ensureBitmap(f)
+                }
+                draw.add(DrawLayer(f.kind, f.id, slot, f.width, f.height, wm, opacity, sel))
+            } else if (l.kind == LayerKind.SOLID) {
+                draw.add(DrawLayer(FootageKind.IMAGE, -1L, -1, l.w, l.h, wm, opacity, sel, LayerKind.SOLID, l.fill))
+            } else if (l.kind == LayerKind.NULL) {
+                draw.add(DrawLayer(FootageKind.IMAGE, -1L, -1, l.w, l.h, wm, opacity, sel, LayerKind.NULL))
             } else {
-                ensureBitmap(f)
-            }
-            draw.add(
-                DrawLayer(
-                    f.kind, f.id, slot, f.width, f.height,
-                    layerMatrix(l, t), layerOpacity(l, t).toFloat(), l.id == selectedId
+                val lt = t - l.startTime
+                val size = Eval.layerValue(l, Path.SHAPE_SIZE, lt)
+                val shape = ShapeDraw(
+                    l.shapeType == ShapeType.ELLIPSE,
+                    size.getOrElse(0) { 0.0 }.toFloat(), size.getOrElse(1) { 0.0 }.toFloat(),
+                    Eval.layerValue(l, Path.SHAPE_ROUND, lt).getOrElse(0) { 0.0 }.toFloat(),
+                    Eval.layerValue(l, Path.STROKE_WIDTH, lt).getOrElse(0) { 0.0 }.toFloat(),
+                    l.fill, l.stroke, l.hasFill, l.hasStroke
                 )
-            )
+                draw.add(DrawLayer(FootageKind.IMAGE, -1L, -1, 1, 1, wm, opacity, sel, LayerKind.SHAPE, 0, shape))
+            }
         }
         scene = Scene(c.width, c.height, c.background, draw)
         pathData = if (playing) null else buildPath(c, c.layers.firstOrNull { it.id == selectedId }, t)
@@ -307,9 +345,27 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         }
 
         val now = Eval.valueAt(pr, lt)
+        // a parented layer's values are in its parent's space: bring everything into composition pixels
+        val space = parentSpace(c.layers, l, t)
+        fun mapped(a: FloatArray): FloatArray {
+            val o = FloatArray(a.size)
+            var i = 0
+            while (i + 1 < a.size) {
+                val q = space.apply(a[i].toDouble(), a[i + 1].toDouble())
+                o[i] = q.first.toFloat()
+                o[i + 1] = q.second.toFloat()
+                i += 2
+            }
+            return o
+        }
+        val nowC = space.apply(now[0], now[1])
+        val handlesC = handles.map {
+            val q = space.apply(it.hx.toDouble(), it.hy.toDouble())
+            PathHandle(it.keyIndex, it.isOut, q.first.toFloat(), q.second.toFloat())
+        }
         return PathData(
-            c.width, c.height, line.toFloatArray(), dots.toFloatArray(), keyXY, seg, handles,
-            now[0].toFloat(), now[1].toFloat()
+            c.width, c.height, mapped(line.toFloatArray()), mapped(dots.toFloatArray()), mapped(keyXY), seg, handlesC,
+            nowC.first.toFloat(), nowC.second.toFloat(), keyXY, space.inverse()
         )
     }
 
@@ -388,13 +444,15 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
                     onPathEditStart?.invoke()
                 }
                 val f = fit(pd.compW, pd.compH)
-                val cx = ((e.x - f[1]) / f[0]).toDouble()
-                val cy = ((e.y - f[2]) / f[0]).toDouble()
+                // finger position in composition pixels, then in the space the layer's values are written in
+                val local = pd.inv.apply(((e.x - f[1]) / f[0]).toDouble(), ((e.y - f[2]) / f[0]).toDouble())
+                val cx = local.first
+                val cy = local.second
                 val h = dragHandle
                 if (h != null) {
                     // the handle is an offset from its keyframe
-                    val kx = pd.keys[h.keyIndex * 2].toDouble()
-                    val ky = pd.keys[h.keyIndex * 2 + 1].toDouble()
+                    val kx = pd.keysLocal[h.keyIndex * 2].toDouble()
+                    val ky = pd.keysLocal[h.keyIndex * 2 + 1].toDouble()
                     onPathTangent?.invoke(h.keyIndex, h.isOut, listOf(cx - kx, cy - ky))
                 } else {
                     onPathKey?.invoke(dragKey, cx, cy)
@@ -652,7 +710,148 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         GLES20.glUniform2f(loc(prog, "uComp"), sc.compW.toFloat(), sc.compH.toFloat())
     }
 
+    // premultiplied colour for the flat program: ARGB colour times the layer's opacity
+    private fun setFlatColor(argb: Int, opacity: Float) {
+        val a = ((argb ushr 24) and 255) / 255f * opacity
+        GLES20.glUniform4f(
+            loc(progFlat, "uColor"),
+            ((argb shr 16) and 255) / 255f * a, ((argb shr 8) and 255) / 255f * a, (argb and 255) / 255f * a, a
+        )
+    }
+
+    private fun drawSolid(sc: Scene, dl: DrawLayer) {
+        GLES20.glUseProgram(progFlat)
+        setTransform(progFlat, sc, dl, quad)
+        setFlatColor(dl.color, dl.opacity)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    // the outline of a shape as x, y pairs around it (ellipse: 72 points; rectangle: 4 corners, or rounded corners)
+    private fun outlinePoints(s: ShapeDraw): FloatArray {
+        val hw = s.w / 2f
+        val hh = s.h / 2f
+        if (s.ellipse) {
+            val n = 72
+            val out = FloatArray(n * 2)
+            for (i in 0 until n) {
+                val a = (2.0 * PI * i / n)
+                out[i * 2] = (cos(a) * hw).toFloat()
+                out[i * 2 + 1] = (sin(a) * hh).toFloat()
+            }
+            return out
+        }
+        val r = min(s.round, min(hw, hh)).coerceAtLeast(0f)
+        if (r < 0.5f) return floatArrayOf(-hw, -hh, hw, -hh, hw, hh, -hw, hh)
+        val seg = 8
+        val pts = ArrayList<Float>()
+        // centre of each rounded corner and the angle its arc starts at (y points down, so -90 is up)
+        val corners = arrayOf(
+            floatArrayOf(hw - r, -hh + r, -90f), floatArrayOf(hw - r, hh - r, 0f),
+            floatArrayOf(-hw + r, hh - r, 90f), floatArrayOf(-hw + r, -hh + r, 180f)
+        )
+        for (c in corners) {
+            for (j in 0..seg) {
+                val a = Math.toRadians(c[2] + 90.0 * j / seg)
+                pts.add(c[0] + (r * cos(a)).toFloat())
+                pts.add(c[1] + (r * sin(a)).toFloat())
+            }
+        }
+        return pts.toFloatArray()
+    }
+
+    // draws the first n floats of ovArr (points in the layer's own pixels) with the layer's transform
+    private fun drawLayerGeometry(sc: Scene, dl: DrawLayer, mode: Int, n: Int, argb: Int) {
+        if (n < 6) return
+        ovBuf.clear()
+        ovBuf.put(ovArr, 0, n)
+        ovBuf.position(0)
+        GLES20.glUseProgram(progFlat)
+        setTransform(progFlat, sc, dl, ovBuf)
+        setFlatColor(argb, dl.opacity)
+        GLES20.glDrawArrays(mode, 0, n / 2)
+    }
+
+    private fun drawShape(sc: Scene, dl: DrawLayer) {
+        val s = dl.shape ?: return
+        if (s.w <= 0f || s.h <= 0f) return
+        val ring = outlinePoints(s)
+        val n = ring.size / 2
+        if (s.hasFill) {
+            var k = 0
+            ovArr[k++] = 0f
+            ovArr[k++] = 0f
+            for (i in 0 until n) {
+                ovArr[k++] = ring[i * 2]
+                ovArr[k++] = ring[i * 2 + 1]
+            }
+            ovArr[k++] = ring[0]
+            ovArr[k++] = ring[1]
+            drawLayerGeometry(sc, dl, GLES20.GL_TRIANGLE_FAN, k, s.fill)
+        }
+        if (s.hasStroke && s.strokeW > 0f) {
+            // a strip along the outline, half the width on each side, mitred at the corners
+            val half = s.strokeW / 2f
+            var k = 0
+            for (i in 0..n) {
+                val idx = i % n
+                val prev = (idx - 1 + n) % n
+                val next = (idx + 1) % n
+                var e1x = ring[idx * 2] - ring[prev * 2]
+                var e1y = ring[idx * 2 + 1] - ring[prev * 2 + 1]
+                var e2x = ring[next * 2] - ring[idx * 2]
+                var e2y = ring[next * 2 + 1] - ring[idx * 2 + 1]
+                val l1 = sqrt(e1x * e1x + e1y * e1y)
+                val l2 = sqrt(e2x * e2x + e2y * e2y)
+                if (l1 < 1e-6f) {
+                    e1x = e2x
+                    e1y = e2y
+                } else {
+                    e1x /= l1
+                    e1y /= l1
+                }
+                if (l2 < 1e-6f) {
+                    e2x = e1x
+                    e2y = e1y
+                } else {
+                    e2x /= l2
+                    e2y /= l2
+                }
+                var nx = -e1y + -e2y
+                var ny = e1x + e2x
+                val nl = sqrt(nx * nx + ny * ny)
+                if (nl < 1e-6f) {
+                    nx = -e1y
+                    ny = e1x
+                } else {
+                    nx /= nl
+                    ny /= nl
+                }
+                val cosHalf = max(0.3f, nx * -e1y + ny * e1x)
+                val ox = nx * half / cosHalf
+                val oy = ny * half / cosHalf
+                if (k + 4 > ovArr.size) break
+                ovArr[k++] = ring[idx * 2] + ox
+                ovArr[k++] = ring[idx * 2 + 1] + oy
+                ovArr[k++] = ring[idx * 2] - ox
+                ovArr[k++] = ring[idx * 2 + 1] - oy
+            }
+            drawLayerGeometry(sc, dl, GLES20.GL_TRIANGLE_STRIP, k, s.stroke)
+        }
+    }
+
     private fun drawLayer(sc: Scene, dl: DrawLayer) {
+        when (dl.lk) {
+            LayerKind.SOLID -> {
+                drawSolid(sc, dl)
+                return
+            }
+            LayerKind.NULL -> return
+            LayerKind.SHAPE -> {
+                drawShape(sc, dl)
+                return
+            }
+            LayerKind.FOOTAGE -> {}
+        }
         if (dl.kind == FootageKind.IMAGE) {
             val tex = imageTexture(dl.footageId)
             if (tex == 0) return
@@ -677,9 +876,9 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
-    private fun drawOutline(sc: Scene, dl: DrawLayer) {
+    private fun drawOutline(sc: Scene, dl: DrawLayer, r: Float, g: Float, b: Float) {
         GLES20.glUseProgram(progFlat)
-        GLES20.glUniform4f(loc(progFlat, "uColor"), 1.0f, 0.85f, 0.2f, 1.0f)
+        GLES20.glUniform4f(loc(progFlat, "uColor"), r, g, b, 1.0f)
         setTransform(progFlat, sc, dl, outline)
         GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, 4)
     }
@@ -820,7 +1019,13 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         for (dl in sc.layers) drawLayer(sc, dl)
         GLES20.glLineWidth(2f * density)
         for (dl in sc.layers) {
-            if (dl.selected) drawOutline(sc, dl)
+            if (dl.lk == LayerKind.SHAPE) continue
+            // a null object shows as a box, in red (yellow when it is selected), like After Effects
+            if (dl.selected) {
+                drawOutline(sc, dl, 1.0f, 0.85f, 0.2f)
+            } else if (dl.lk == LayerKind.NULL) {
+                drawOutline(sc, dl, 0.9f, 0.25f, 0.25f)
+            }
         }
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
 

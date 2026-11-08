@@ -35,6 +35,13 @@ object Eval {
     }
 
     fun layerValue(layer: Layer, path: String, t: Long): List<Double> {
+        // Separate Dimensions: X Position and Y Position are put back together as the layer's Position,
+        // so the preview, the export and everything else keep reading Position as before
+        if (path == Path.POSITION && layer.props.containsKey(Path.POSITION_X)) {
+            val x = layer.props[Path.POSITION_X]?.let { valueAt(it, t) }?.getOrNull(0) ?: 0.0
+            val y = layer.props[Path.POSITION_Y]?.let { valueAt(it, t) }?.getOrNull(0) ?: 0.0
+            return listOf(x, y)
+        }
         val p = layer.props[path] ?: return emptyList()
         return valueAt(p, t)
     }

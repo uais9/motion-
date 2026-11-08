@@ -17,6 +17,7 @@ import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -44,6 +45,9 @@ class MainActivity : Activity() {
     // keyframes selected on the timeline (layer times) and the copied ones, by property
     private var selectedKeys: Set<Long> = emptySet()
     private var keyClip: Map<String, List<Keyframe>> = emptyMap()
+    // layers selected together (Multi-select on), in the order they were tapped
+    private val multiIds = LinkedHashSet<Long>()
+    private var multiMode = false
     // Motion Sketch: the finger path being drawn (layer time, [x, y]) and the Smoother tolerance to use after
     private val sketchSamples = ArrayList<Pair<Long, List<Double>>>()
     private var sketchActive = false
@@ -187,7 +191,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             addView(btn("New comp") { showNewComp() })
             addView(btn("Import") { pickMedia() })
-            addView(btn("Add layer") { showAddLayer() })
+            addView(btn("Layer") { showLayerMenu() })
             addView(btn("Info") { showInfo() })
         }
         graph = GraphEditorView(this).apply {
@@ -289,7 +293,8 @@ class MainActivity : Activity() {
         val c = session.currentComp()
         compView.setData(session.project, c, currentTime, selectedLayerId, playing)
         pruneKeys(c)
-        layerTimeline.setData(session.project, c, currentTime, selectedLayerId, selectedKeys)
+        multiIds.retainAll((c?.layers ?: emptyList()).map { it.id }.toSet())
+        layerTimeline.setData(session.project, c, currentTime, selectedLayerId, selectedKeys, multiIds)
         updatePanel()
     }
 
@@ -311,6 +316,12 @@ class MainActivity : Activity() {
 
     private fun selectLayer(id: Long) {
         if (id != selectedLayerId) selectedKeys = emptySet()
+        // with Multi-select on, tapping a layer adds it to the group (tap again to take it out)
+        if (multiMode && id >= 0L) {
+            if (!multiIds.remove(id)) multiIds.add(id)
+        } else {
+            multiIds.clear()
+        }
         selectedLayerId = id
         refresh()
     }
@@ -787,8 +798,14 @@ class MainActivity : Activity() {
         val sel = selectedPair() ?: return
         val c = sel.first
         val l = sel.second
-        val f = session.project.footage.firstOrNull { it.id == l.footageId } ?: return
-        val d = defaultTransform(f, c)[path]?.value ?: return
+        val defaults = layerDefaults(session.project, c, l)
+        val d = defaults[path]?.value
+            ?: when (path) {
+                Path.POSITION_X -> defaults[Path.POSITION]?.value?.take(1)
+                Path.POSITION_Y -> defaults[Path.POSITION]?.value?.drop(1)?.take(1)
+                else -> null
+            }
+            ?: return
         val lt = layerTimeNow(c, l)
         session.edit { p -> p.withLayerProp(c.id, l.id, path) { pr -> setPropAt(pr, lt, d) } }
         refresh()
@@ -1090,7 +1107,8 @@ class MainActivity : Activity() {
             "Easy Ease", "Easy Ease In", "Easy Ease Out",
             "Time-Reverse Keyframes", "Scale Keyframes in Time…", "Exponential Scale",
             "Smoother…", "Wiggler…", "Motion Sketch…",
-            "Select All Keyframes", "Select Keyframes After", "Select Keyframes Before"
+            "Select All Keyframes", "Select Keyframes After", "Select Keyframes Before",
+            "Separate Dimensions (Position)"
         )
         AlertDialog.Builder(this)
             .setTitle("Animation")
@@ -1110,10 +1128,25 @@ class MainActivity : Activity() {
                     11 -> showMotionSketchDialog()
                     12 -> selectKeysWhere { _ -> true }
                     13 -> selectKeysWhere { t -> t > (selectedKeys.maxOrNull() ?: Long.MAX_VALUE) }
-                    else -> selectKeysWhere { t -> t < (selectedKeys.minOrNull() ?: Long.MIN_VALUE) }
+                    14 -> selectKeysWhere { t -> t < (selectedKeys.minOrNull() ?: Long.MIN_VALUE) }
+                    else -> toggleSeparate()
                 }
             }
             .show()
+    }
+
+    // Animation > Separate Dimensions: Position <-> X Position and Y Position
+    private fun toggleSeparate() {
+        val sel = selectedPair()
+        if (sel == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val separated = sel.second.props.containsKey(Path.POSITION_X)
+        session.edit { p -> p.withSeparatedDimensions(sel.first.id, sel.second.id, !separated) }
+        selectedKeys = emptySet()
+        toast(if (separated) "Position is one property again" else "Position is now X Position and Y Position")
+        refresh()
     }
 
     private fun allKeyTimes(): Set<Long> {
@@ -1170,7 +1203,7 @@ class MainActivity : Activity() {
             .setView(form)
             .setPositiveButton("OK") { _, _ ->
                 val v = pct.text.toString().toDoubleOrNull()
-                if (v == null || v <= 0.0) toast("Check the number") else scaleSelectedKeys(selectedKeys.min(), v / 100.0)
+                if (v == null || v <= 0.0) toast("Check the number") else scaleSelectedKeys(selectedKeys.minOrNull() ?: 0L, v / 100.0)
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -1345,6 +1378,257 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    // ---------- Layer menu (like After Effects' Layer menu) ----------
+
+    private fun showLayerMenu() {
+        val comp = session.currentComp()
+        if (comp == null) {
+            toast("Create a composition first")
+            return
+        }
+        val items = arrayOf(
+            "Add Footage Layer…", "New Solid…", "New Null Object",
+            "New Shape Layer: Rectangle", "New Shape Layer: Ellipse",
+            "Duplicate Layer", "Rename Layer…", "Parent…", "Edit Colors…",
+            if (multiMode) "Multi-select: ON (tap to turn off)" else "Multi-select: off (tap to turn on)",
+            "Sequence Layers…"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Layer")
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> showAddLayer()
+                    1 -> showNewSolidDialog()
+                    2 -> addNewLayer { p, id -> p.withNewNull(id) }
+                    3 -> addNewLayer { p, id -> p.withNewShape(id, ShapeType.RECT, 0xFF4C8DFF.toInt()) }
+                    4 -> addNewLayer { p, id -> p.withNewShape(id, ShapeType.ELLIPSE, 0xFFFF6B6B.toInt()) }
+                    5 -> duplicateLayer()
+                    6 -> showRenameDialog()
+                    7 -> showParentDialog()
+                    8 -> showColorsDialog()
+                    9 -> toggleMulti()
+                    else -> showSequenceDialog()
+                }
+            }
+            .show()
+    }
+
+    // makes a new layer (on top, the whole length of the composition) and selects it
+    private fun addNewLayer(make: (Project, Long) -> Project) {
+        val c = session.currentComp() ?: return
+        session.edit { p -> make(p, c.id) }
+        selectedLayerId = session.currentComp()?.layers?.firstOrNull()?.id ?: -1L
+        selectedKeys = emptySet()
+        multiIds.clear()
+        refresh()
+    }
+
+    private fun hexOf(argb: Int): String = String.format(Locale.US, "#%06X", argb and 0xFFFFFF)
+
+    private fun parseHex(text: String): Int? {
+        return try {
+            Color.parseColor(text.trim())
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun intEdit(v: Int): EditText = EditText(this).apply {
+        setText(v.toString())
+        inputType = InputType.TYPE_CLASS_NUMBER
+    }
+
+    private fun showNewSolidDialog() {
+        val c = session.currentComp() ?: return
+        val name = EditText(this).apply { setText("Solid") }
+        val color = EditText(this).apply { setText("#FFFFFF") }
+        val w = intEdit(c.width)
+        val h = intEdit(c.height)
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(label("Name"))
+            addView(name)
+            addView(label("Colour (#RRGGBB)"))
+            addView(color)
+            addView(formRow("Width x Height (pixels)", w, h))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Solid Settings")
+            .setView(form)
+            .setPositiveButton("OK") { _, _ ->
+                val argb = parseHex(color.text.toString())
+                val sw = w.text.toString().toIntOrNull() ?: 0
+                val sh = h.text.toString().toIntOrNull() ?: 0
+                if (argb == null || sw < 1 || sh < 1 || sw > 8192 || sh > 8192) {
+                    toast("Check the colour and the size")
+                } else {
+                    val nm = name.text.toString().trim().ifBlank { null }
+                    addNewLayer { p, id -> p.withNewSolid(id, nm, argb, sw, sh) }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun duplicateLayer() {
+        val sel = selectedPair()
+        if (sel == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val idx = sel.first.layers.indexOfFirst { it.id == sel.second.id }
+        session.edit { p -> p.withLayerDuplicated(sel.first.id, sel.second.id) }
+        selectedLayerId = session.currentComp()?.layers?.getOrNull(idx)?.id ?: selectedLayerId
+        multiIds.clear()
+        refresh()
+    }
+
+    private fun showRenameDialog() {
+        val sel = selectedPair()
+        if (sel == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val name = EditText(this).apply { setText(sel.second.name) }
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(name)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Rename Layer")
+            .setView(form)
+            .setPositiveButton("OK") { _, _ ->
+                val n = name.text.toString().trim()
+                if (n.isNotEmpty()) {
+                    session.edit { p -> p.withLayerRenamed(sel.first.id, sel.second.id, n) }
+                    refresh()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // The Parent column: pick the layer this one follows (or None). The layer keeps looking the same. With
+    // Multi-select on, all the selected layers get that parent at once.
+    private fun showParentDialog() {
+        val sel = selectedPair()
+        if (sel == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val c = sel.first
+        val l = sel.second
+        val children = if (multiIds.size > 1 && l.id in multiIds) multiIds.toList() else listOf(l.id)
+        val targets = c.layers.filter { it.id !in children }
+        val names = arrayOf("None") + targets.map { it.name }
+        AlertDialog.Builder(this)
+            .setTitle(if (children.size > 1) "Parent of ${children.size} layers" else "Parent of ${l.name}")
+            .setItems(names) { _, which ->
+                val pid = if (which == 0) -1L else targets[which - 1].id
+                val t = snapFrame(currentTime, c.frameRate)
+                session.edit { p ->
+                    var q = p
+                    for (id in children) q = q.withLayerParent(c.id, id, pid, t)
+                    q
+                }
+                refresh()
+            }
+            .show()
+    }
+
+    // colour of a solid; fill and stroke of a shape layer
+    private fun showColorsDialog() {
+        val sel = selectedPair()
+        val l = sel?.second
+        if (sel == null || l == null || (l.kind != LayerKind.SOLID && l.kind != LayerKind.SHAPE)) {
+            toast("Select a solid or a shape layer first")
+            return
+        }
+        val fill = EditText(this).apply { setText(hexOf(l.fill)) }
+        val stroke = EditText(this).apply { setText(hexOf(l.stroke)) }
+        val fillOn = CheckBox(this).apply {
+            text = "Fill"
+            isChecked = l.hasFill
+        }
+        val strokeOn = CheckBox(this).apply {
+            text = "Stroke"
+            isChecked = l.hasStroke
+        }
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(label(if (l.kind == LayerKind.SOLID) "Colour (#RRGGBB)" else "Fill colour (#RRGGBB)"))
+            addView(fill)
+            if (l.kind == LayerKind.SHAPE) {
+                addView(fillOn)
+                addView(label("Stroke colour (#RRGGBB)"))
+                addView(stroke)
+                addView(strokeOn)
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Colours")
+            .setView(form)
+            .setPositiveButton("OK") { _, _ ->
+                val f = parseHex(fill.text.toString())
+                val s = parseHex(stroke.text.toString())
+                if (f == null || s == null) {
+                    toast("Check the colours")
+                } else {
+                    session.edit { p ->
+                        p.withLayerColors(sel.first.id, l.id, f, s, if (l.kind == LayerKind.SHAPE) fillOn.isChecked else true, strokeOn.isChecked && l.kind == LayerKind.SHAPE)
+                    }
+                    refresh()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun toggleMulti() {
+        multiMode = !multiMode
+        multiIds.clear()
+        if (multiMode && selectedLayerId >= 0L) multiIds.add(selectedLayerId)
+        toast(if (multiMode) "Tap layers to add them to the group" else "Multi-select is off")
+        pushToView()
+    }
+
+    // Layer > Keyframe Assistant > Sequence Layers: the selected layers one after another, in the order you tapped them
+    private fun showSequenceDialog() {
+        val c = session.currentComp() ?: return
+        if (multiIds.size < 2) {
+            toast("Turn on Multi-select and tap two or more layers first")
+            return
+        }
+        val overlap = numEdit(0.0)
+        val transition = spinnerOf(arrayOf("Off", "Cross Dissolve"))
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(8))
+            addView(formRow("Overlap (seconds)", overlap))
+            addView(label("Transition"))
+            addView(transition)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Sequence Layers")
+            .setView(form)
+            .setPositiveButton("OK") { _, _ ->
+                val ov = overlap.text.toString().toDoubleOrNull()
+                if (ov == null || ov < 0.0) {
+                    toast("Check the number")
+                } else {
+                    val ticks = snapFrame(secondsToTicks(ov), c.frameRate)
+                    val ids = multiIds.toList()
+                    session.edit { p -> p.withLayersSequenced(c.id, ids, ticks, transition.selectedItemPosition == 1) }
+                    refresh()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun showInfo() {
         AlertDialog.Builder(this)
             .setTitle("Project info")
@@ -1354,7 +1638,7 @@ class MainActivity : Activity() {
     }
 
     private fun showSelfTest() {
-        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run() + KeyframeTest.run() + GraphTest.run()
+        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run() + KeyframeTest.run() + GraphTest.run() + LayersTest.run()
         AlertDialog.Builder(this)
             .setTitle("Self-test")
             .setMessage(lines.joinToString("\n"))
@@ -1402,7 +1686,9 @@ class MainActivity : Activity() {
             for ((i, l) in c.layers.withIndex()) {
                 val t = currentTime - l.startTime
                 val state = if (l.enabled) "" else " (hidden)"
-                sb.append("  ${i + 1}. ${l.name}$state\n")
+                val kindTxt = if (l.kind == LayerKind.FOOTAGE) "" else " [${l.kind.name.lowercase()}]"
+                val parentTxt = c.layers.firstOrNull { it.id == l.parentId }?.let { " parent: ${it.name}" } ?: ""
+                sb.append("  ${i + 1}. ${l.name}$kindTxt$state$parentTxt\n")
                 sb.append("     in ${timecode(l.inPoint, c.frameRate)}  out ${timecode(l.outPoint, c.frameRate)}\n")
                 sb.append("     position (${fmtNums(Eval.layerValue(l, Path.POSITION, t))})  anchor (${fmtNums(Eval.layerValue(l, Path.ANCHOR, t))})\n")
                 sb.append("     scale (${fmtNums(Eval.layerValue(l, Path.SCALE, t))})%  rotation ${fmtNums(Eval.layerValue(l, Path.ROTATION, t))}  opacity ${fmtNums(Eval.layerValue(l, Path.OPACITY, t))}%\n")
