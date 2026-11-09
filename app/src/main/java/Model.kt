@@ -77,6 +77,10 @@ object Path {
     const val STROKE_WIDTH = "shape/strokeWidth"
 }
 
+// An effect on a layer. `type` is the id of an effect file in assets/effects (like "gaussian_blur").
+// Its settings are properties of the layer, with paths like "fx/<id>/<key>".
+data class EffectInstance(val id: Long, val type: String, val enabled: Boolean = true)
+
 // A layer in a composition.
 // startTime: comp time at which the source's own time 0 sits.
 // inPoint / outPoint: the span of comp time the layer is visible.
@@ -97,7 +101,8 @@ data class Layer(
     val stroke: Int = 0xFFFFFFFF.toInt(), // stroke colour of a shape
     val hasFill: Boolean = true,
     val hasStroke: Boolean = false,
-    val shapeType: ShapeType = ShapeType.RECT
+    val shapeType: ShapeType = ShapeType.RECT,
+    val effects: List<EffectInstance> = emptyList() // in the order they run
 )
 
 // A composition. layers[0] is the TOP layer.

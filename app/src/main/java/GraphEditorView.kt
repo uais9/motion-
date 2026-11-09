@@ -131,6 +131,19 @@ class GraphEditorView(context: Context) : View(context) {
             n = n.map { if (it == "Position") "Pos" else if (it == "Rotation") "Rot" else if (it == "Opacity") "Opac" else it } +
                 listOf("Size", "Round", "Stroke")
         }
+        // animated effect settings get a chip too
+        if (l != null) {
+            for (e in l.effects) {
+                val def = EffectRegistry.get(e.type) ?: continue
+                for (d in def.params) {
+                    val path = fxPath(e.id, d.key)
+                    if (l.props[path]?.animated == true) {
+                        p = p + path
+                        n = n + d.label.take(6)
+                    }
+                }
+            }
+        }
         return Pair(p, n)
     }
 

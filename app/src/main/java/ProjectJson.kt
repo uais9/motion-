@@ -111,6 +111,15 @@ object ProjectJson {
         o.put("hasFill", l.hasFill)
         o.put("hasStroke", l.hasStroke)
         o.put("shapeType", l.shapeType.name)
+        val ea = JSONArray()
+        for (e in l.effects) {
+            val eo = JSONObject()
+            eo.put("id", e.id)
+            eo.put("type", e.type)
+            eo.put("enabled", e.enabled)
+            ea.put(eo)
+        }
+        o.put("effects", ea)
         val po = JSONObject()
         for ((path, prop) in l.props) po.put(path, propToJson(prop))
         o.put("props", po)
@@ -191,6 +200,17 @@ object ProjectJson {
         }
     }
 
+    private fun effectsFromJson(a: JSONArray?): List<EffectInstance> {
+        val out = ArrayList<EffectInstance>()
+        if (a != null) {
+            for (i in 0 until a.length()) {
+                val eo = a.getJSONObject(i)
+                out.add(EffectInstance(eo.getLong("id"), eo.getString("type"), eo.optBoolean("enabled", true)))
+            }
+        }
+        return out
+    }
+
     private fun footageFromJson(o: JSONObject): Footage {
         return Footage(
             o.getLong("id"),
@@ -249,7 +269,8 @@ object ProjectJson {
             stroke = o.optInt("stroke", 0xFFFFFFFF.toInt()),
             hasFill = o.optBoolean("hasFill", true),
             hasStroke = o.optBoolean("hasStroke", false),
-            shapeType = enumOr(o.optString("shapeType", "RECT"), ShapeType.RECT)
+            shapeType = enumOr(o.optString("shapeType", "RECT"), ShapeType.RECT),
+            effects = effectsFromJson(o.optJSONArray("effects"))
         )
     }
 

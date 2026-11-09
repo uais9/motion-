@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
@@ -55,13 +56,23 @@ class PropertyPanelView(context: Context) : View(context) {
         private val SHAPE_ROUND_ROW = Row(Path.SHAPE_ROUND, "Roundness", 1, 1.0, 0.0, null)
         private val SHAPE_STROKE_ROW = Row(Path.STROKE_WIDTH, "Stroke Width", 1, 0.5, 0.0, null)
 
-        fun labelOf(path: String): String =
-            (ROWS + SEP_ROWS + listOf(SHAPE_SIZE_ROW, SHAPE_ROUND_ROW, SHAPE_STROKE_ROW)).firstOrNull { it.path == path }?.label ?: path
+        fun labelOf(path: String): String {
+            if (path.startsWith("fx/")) return fxLabel(path)
+            return (ROWS + SEP_ROWS + listOf(SHAPE_SIZE_ROW, SHAPE_ROUND_ROW, SHAPE_STROKE_ROW)).firstOrNull { it.path == path }?.label ?: path
+        }
 
         private fun rowsFor(l: Layer?): List<Row> {
             var r = if (l != null && l.props.containsKey(Path.POSITION_X)) SEP_ROWS else ROWS
             if (l != null && l.kind == LayerKind.SHAPE) {
                 r = r + SHAPE_SIZE_ROW + (if (l.shapeType == ShapeType.RECT) listOf(SHAPE_ROUND_ROW) else emptyList()) + SHAPE_STROKE_ROW
+            }
+            // the effects: a title row for each, then its settings
+            if (l != null) {
+                for (e in l.effects) {
+                    val def = EffectRegistry.get(e.type) ?: continue
+                    r = r + Row("fxhead/${e.id}", def.name + (if (e.enabled) "" else " (off)"), 0, 1.0, null, null)
+                    for (p in def.params) r = r + Row(fxPath(e.id, p.key), p.label, p.dims, p.unitsPerDp, p.lo, p.hi)
+                }
             }
             return r
         }
@@ -74,6 +85,7 @@ class PropertyPanelView(context: Context) : View(context) {
     var onReset: ((String) -> Unit)? = null
     var onToggle: ((String) -> Unit)? = null
     var onKey: ((String) -> Unit)? = null
+    var onEffectTap: ((Long) -> Unit)? = null // the title row of an effect was tapped
 
     private var layer: Layer? = null
     private var layerTime = 0L
@@ -143,8 +155,12 @@ class PropertyPanelView(context: Context) : View(context) {
         RectF(6f * density, rowTop(i), 42f * density, rowTop(i) + rowH)
 
     private fun cellRect(i: Int, d: Int): RectF {
-        val x0 = 112f * density + d * 80f * density
-        return RectF(x0, rowTop(i) + 3f * density, x0 + 74f * density, rowTop(i) + rowH - 3f * density)
+        // a colour has 3 numbers, so its boxes are narrower
+        val narrow = rows[i].dims >= 3
+        val pitch = (if (narrow) 56f else 80f) * density
+        val boxW = (if (narrow) 52f else 74f) * density
+        val x0 = 112f * density + d * pitch
+        return RectF(x0, rowTop(i) + 3f * density, x0 + boxW, rowTop(i) + rowH - 3f * density)
     }
 
     private fun keyRect(i: Int): RectF =
@@ -155,6 +171,15 @@ class PropertyPanelView(context: Context) : View(context) {
         activeKind = 0
         activeDim = 0
         for (i in rows.indices) {
+            if (rows[i].dims == 0) {
+                // the title row of an effect: the whole row is one button
+                if (y >= rowTop(i) && y <= rowTop(i) + rowH) {
+                    activeRow = i
+                    activeKind = 4
+                    return
+                }
+                continue
+            }
             if (watchRect(i).contains(x, y)) {
                 activeRow = i
                 activeKind = 1
@@ -210,6 +235,18 @@ class PropertyPanelView(context: Context) : View(context) {
         val rh = rowH
         for (i in rows.indices) {
             val row = rows[i]
+            if (row.dims == 0) {
+                val top0 = rowTop(i)
+                cellPaint.color = Color.parseColor("#1E2030")
+                canvas.drawRect(0f, top0 + 1f * density, width.toFloat(), top0 + rh - 1f * density, cellPaint)
+                textPaint.color = Color.parseColor("#F5B25A")
+                textPaint.textSize = 12f * density
+                textPaint.typeface = Typeface.DEFAULT_BOLD
+                textPaint.textAlign = Paint.Align.LEFT
+                canvas.drawText("fx  " + row.label, 12f * density, top0 + rh * 0.64f, textPaint)
+                textPaint.typeface = Typeface.DEFAULT
+                continue
+            }
             val prop = l.props[row.path]
             val animated = prop != null && prop.animated
             val hasKey = prop != null && prop.keys.any { it.time == layerTime }
@@ -228,7 +265,7 @@ class PropertyPanelView(context: Context) : View(context) {
             canvas.drawLine(wx - 2f * density, wy - 9f * density, wx + 2f * density, wy - 9f * density, linePaint)
 
             textPaint.color = Color.LTGRAY
-            textPaint.textSize = 12f * density
+            textPaint.textSize = (if (row.path.startsWith("fx/")) 10.5f else 12f) * density
             textPaint.textAlign = Paint.Align.LEFT
             canvas.drawText(row.label, 46f * density, baseline, textPaint)
 
@@ -320,6 +357,7 @@ class PropertyPanelView(context: Context) : View(context) {
                             1 -> onToggle?.invoke(path)
                             2 -> onTapValue?.invoke(path)
                             3 -> onKey?.invoke(path)
+                            4 -> path.removePrefix("fxhead/").toLongOrNull()?.let { onEffectTap?.invoke(it) }
                         }
                     }
                 }

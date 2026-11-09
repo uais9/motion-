@@ -24,6 +24,7 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.concurrent.thread
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
@@ -82,6 +83,9 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         val hasStroke: Boolean
     )
 
+    // an effect on a layer, with its settings worked out for this moment
+    private class FxDraw(val def: EffectDef, val values: Map<String, List<Double>>)
+
     private class DrawLayer(
         val kind: FootageKind,
         val footageId: Long,
@@ -93,7 +97,13 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         val selected: Boolean,
         val lk: LayerKind = LayerKind.FOOTAGE,
         val color: Int = 0, // solid colour (ARGB)
-        val shape: ShapeDraw? = null
+        val shape: ShapeDraw? = null,
+        val fx: List<FxDraw> = emptyList(),
+        // the layer's rectangle in its own pixels (where effects work): top left and size
+        val bx: Float = 0f,
+        val by: Float = 0f,
+        val bw: Float = 0f,
+        val bh: Float = 0f
     )
 
     private class Scene(
@@ -232,6 +242,7 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
             val wm = worldMatrix(c.layers, l, t)
             val opacity = layerOpacity(l, t).toFloat()
             val sel = l.id == selectedId
+            val fxList = fxOf(l, t)
             if (l.kind == LayerKind.FOOTAGE) {
                 val f = p.footage.firstOrNull { it.id == l.footageId } ?: continue
                 var slot = -1
@@ -240,9 +251,19 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
                 } else {
                     ensureBitmap(f)
                 }
-                draw.add(DrawLayer(f.kind, f.id, slot, f.width, f.height, wm, opacity, sel))
+                draw.add(
+                    DrawLayer(
+                        f.kind, f.id, slot, f.width, f.height, wm, opacity, sel,
+                        LayerKind.FOOTAGE, 0, null, fxList, 0f, 0f, f.width.toFloat(), f.height.toFloat()
+                    )
+                )
             } else if (l.kind == LayerKind.SOLID) {
-                draw.add(DrawLayer(FootageKind.IMAGE, -1L, -1, l.w, l.h, wm, opacity, sel, LayerKind.SOLID, l.fill))
+                draw.add(
+                    DrawLayer(
+                        FootageKind.IMAGE, -1L, -1, l.w, l.h, wm, opacity, sel, LayerKind.SOLID, l.fill,
+                        null, fxList, 0f, 0f, l.w.toFloat(), l.h.toFloat()
+                    )
+                )
             } else if (l.kind == LayerKind.NULL) {
                 draw.add(DrawLayer(FootageKind.IMAGE, -1L, -1, l.w, l.h, wm, opacity, sel, LayerKind.NULL))
             } else {
@@ -255,7 +276,14 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
                     Eval.layerValue(l, Path.STROKE_WIDTH, lt).getOrElse(0) { 0.0 }.toFloat(),
                     l.fill, l.stroke, l.hasFill, l.hasStroke
                 )
-                draw.add(DrawLayer(FootageKind.IMAGE, -1L, -1, 1, 1, wm, opacity, sel, LayerKind.SHAPE, 0, shape))
+                val sbw = shape.w + (if (shape.hasStroke) shape.strokeW else 0f)
+                val sbh = shape.h + (if (shape.hasStroke) shape.strokeW else 0f)
+                draw.add(
+                    DrawLayer(
+                        FootageKind.IMAGE, -1L, -1, 1, 1, wm, opacity, sel, LayerKind.SHAPE, 0, shape,
+                        fxList, -sbw / 2f, -sbh / 2f, sbw, sbh
+                    )
+                )
             }
         }
         scene = Scene(c.width, c.height, c.background, draw)
@@ -637,6 +665,12 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // a new OpenGL context: everything made in the old one is gone
+        fxPrograms.clear()
+        java.util.Arrays.fill(fxTex, 0)
+        java.util.Arrays.fill(fxFbo, 0)
+        fxW = 0
+        fxH = 0
         progImage = buildProgram(vertexSrc, imageFragSrc)
         progVideo = buildProgram(vertexSrc, videoFragSrc)
         progFlat = buildProgram(vertexSrc, flatFragSrc)
@@ -883,6 +917,241 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         GLES20.glDrawArrays(GLES20.GL_LINE_LOOP, 0, 4)
     }
 
+    // ---------- effects (the .json and .frag files in assets/effects) ----------
+    // A layer with effects is drawn in steps: the layer itself into a picture (a little bigger than the layer,
+    // so a blur or a shadow has room), then each effect's passes one after the other, then that picture is put
+    // into the composition with the layer's transform and opacity.
+
+    private val fxTex = IntArray(3)
+    private val fxFbo = IntArray(3)
+    private var fxW = 0
+    private var fxH = 0
+    private val fxPrograms = HashMap<String, Int>()
+    private val fxReported = HashSet<String>()
+
+    // called on the main thread when an effect's shader does not compile
+    var onFxError: ((String) -> Unit)? = null
+
+    private val fxVertexSrc = """
+        attribute vec2 aPos;
+        varying vec2 vUv;
+        void main() {
+            vUv = aPos;
+            gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0);
+        }
+    """
+
+    // what every effect shader gets for free (see Effects.kt)
+    private val fxHeader = """
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+        precision highp float;
+        #else
+        precision mediump float;
+        #endif
+        varying vec2 vUv;
+        uniform sampler2D uTex;
+        uniform sampler2D uTex2;
+        uniform vec2 uWork;
+        uniform float uPad;
+        uniform vec2 uLayer;
+        uniform vec4 uBox;
+    """
+
+    // the effects of a layer, with their settings at this moment (only the ones that are on)
+    private fun fxOf(l: Layer, t: Long): List<FxDraw> {
+        if (l.effects.isEmpty() || l.kind == LayerKind.NULL) return emptyList()
+        val lt = t - l.startTime
+        val out = ArrayList<FxDraw>()
+        for (e in l.effects) {
+            if (!e.enabled) continue
+            val def = EffectRegistry.get(e.type) ?: continue
+            val vals = HashMap<String, List<Double>>()
+            for (p in def.params) vals[p.key] = Eval.layerValue(l, fxPath(e.id, p.key), lt)
+            out.add(FxDraw(def, vals))
+        }
+        return out
+    }
+
+    private fun fxEnv(fx: FxDraw, bw: Float, bh: Float, workW: Double, workH: Double, pad: Double): (String, Int) -> Double =
+        { name, i ->
+            when (name) {
+                "layerW" -> bw.toDouble()
+                "layerH" -> bh.toDouble()
+                "workW" -> workW
+                "workH" -> workH
+                "pad" -> pad
+                else -> fx.values[name]?.getOrElse(i) { 0.0 } ?: 0.0
+            }
+        }
+
+    private fun fxProgram(def: EffectDef, ps: PassDef): Int {
+        val key = def.id + "/" + ps.shader
+        val have = fxPrograms[key]
+        if (have != null) return have
+        var prog = -1
+        try {
+            prog = buildProgram(fxVertexSrc, fxHeader + (def.shaders[ps.shader] ?: ""))
+        } catch (e: Exception) {
+            if (fxReported.add(key)) {
+                val msg = "The shader " + ps.shader + " of " + def.name + " has an error:\n" + (e.message ?: "")
+                post { onFxError?.invoke(msg) }
+            }
+        }
+        fxPrograms[key] = prog
+        return prog
+    }
+
+    // three pictures to work in (the one being read, the one being written, and a spare)
+    private fun ensureFx(w: Int, h: Int): Boolean {
+        if (fxW == w && fxH == h && fxFbo[0] != 0) return true
+        if (fxFbo[0] != 0) {
+            GLES20.glDeleteFramebuffers(3, fxFbo, 0)
+            GLES20.glDeleteTextures(3, fxTex, 0)
+        }
+        GLES20.glGenTextures(3, fxTex, 0)
+        GLES20.glGenFramebuffers(3, fxFbo, 0)
+        for (i in 0 until 3) {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fxTex[i])
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fxFbo[i])
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, fxTex[i], 0)
+            if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) != GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                fxW = 0
+                fxH = 0
+                return false
+            }
+        }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        fxW = w
+        fxH = h
+        return true
+    }
+
+    // a picture put into the composition as a rectangle w x h (the picture's top left is the rectangle's top left)
+    private fun drawTexQuad(sc: Scene, tex: Int, w: Float, h: Float, m: Affine, opacity: Float) {
+        GLES20.glUseProgram(progImage)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        GLES20.glUniform1i(loc(progImage, "uTex"), 0)
+        GLES20.glUniform1f(loc(progImage, "uOpacity"), opacity)
+        val aPos = GLES20.glGetAttribLocation(progImage, "aPos")
+        GLES20.glEnableVertexAttribArray(aPos)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+        GLES20.glUniform2f(loc(progImage, "uSize"), w, h)
+        GLES20.glUniform4f(loc(progImage, "uAB"), m.a.toFloat(), m.b.toFloat(), m.c.toFloat(), m.d.toFloat())
+        GLES20.glUniform2f(loc(progImage, "uEF"), m.e.toFloat(), m.f.toFloat())
+        GLES20.glUniform2f(loc(progImage, "uComp"), sc.compW.toFloat(), sc.compH.toFloat())
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    // runs the passes of one effect. input = the picture it starts from, gives back the picture it ends with.
+    private fun runEffect(
+        fx: FxDraw, input: Int, texW: Int, texH: Int,
+        workW: Double, workH: Double, pad: Double, bw: Float, bh: Float
+    ): Int {
+        var last = input
+        val env = fxEnv(fx, bw, bh, workW, workH, pad)
+        for (ps in fx.def.passes) {
+            if (ps.whenExpr != null && evalExpr(ps.whenExpr, env) == 0.0) continue
+            val prog = fxProgram(fx.def, ps)
+            if (prog <= 0) continue
+            // "prev" is what the effect started with, "last" is what the pass before made
+            val ins = ps.inputs.map { if (it == "prev") input else last }
+            var out = 0
+            while (out == input || out == last) out++
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fxFbo[out])
+            GLES20.glViewport(0, 0, texW, texH)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            GLES20.glUseProgram(prog)
+            for (k in ins.indices) {
+                if (k > 1) break
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + k)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fxTex[ins[k]])
+            }
+            GLES20.glUniform1i(loc(prog, "uTex"), 0)
+            GLES20.glUniform1i(loc(prog, "uTex2"), 1)
+            GLES20.glUniform2f(loc(prog, "uWork"), workW.toFloat(), workH.toFloat())
+            GLES20.glUniform1f(loc(prog, "uPad"), pad.toFloat())
+            GLES20.glUniform2f(loc(prog, "uLayer"), bw, bh)
+            GLES20.glUniform4f(
+                loc(prog, "uBox"),
+                (pad / workW).toFloat(), (pad / workH).toFloat(), ((pad + bw) / workW).toFloat(), ((pad + bh) / workH).toFloat()
+            )
+            for (u in ps.uniforms) {
+                val v = u.second.map { evalExpr(it, env).toFloat() }
+                val l = loc(prog, u.first)
+                when (v.size) {
+                    1 -> GLES20.glUniform1f(l, v[0])
+                    2 -> GLES20.glUniform2f(l, v[0], v[1])
+                    3 -> GLES20.glUniform3f(l, v[0], v[1], v[2])
+                    4 -> GLES20.glUniform4f(l, v[0], v[1], v[2], v[3])
+                }
+            }
+            val aPos = GLES20.glGetAttribLocation(prog, "aPos")
+            GLES20.glEnableVertexAttribArray(aPos)
+            GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            last = out
+        }
+        return last
+    }
+
+    private fun drawWithEffects(sc: Scene, dl: DrawLayer, vx: Int, vy: Int, vw: Int, vh: Int) {
+        val bw = dl.bw
+        val bh = dl.bh
+        if (bw < 1f || bh < 1f) {
+            drawLayer(sc, dl)
+            return
+        }
+        // how far the effects spread beyond the layer's edges (in steps of 32 so the pictures are not made again every frame)
+        var padRaw = 0.0
+        for (fx in dl.fx) padRaw += max(0.0, evalExpr(fx.def.pad, fxEnv(fx, bw, bh, 0.0, 0.0, 0.0)))
+        val pad = min(1024.0, ceil(padRaw / 32.0) * 32.0)
+        val workW = bw + 2.0 * pad
+        val workH = bh + 2.0 * pad
+        // big layers are worked on a little smaller (2048 pixels at most)
+        val s = min(1.0, min(2048.0 / workW, 2048.0 / workH))
+        val texW = max(1, ceil(workW * s).toInt())
+        val texH = max(1, ceil(workH * s).toInt())
+        if (!ensureFx(texW, texH)) {
+            drawLayer(sc, dl)
+            return
+        }
+
+        // step 1: the layer itself into picture 0. The matrix turns it so that the picture's top is the layer's top.
+        val stub = Scene(texW, texH, 0, emptyList())
+        val m0 = Affine(s, 0.0, 0.0, -s, s * (pad - dl.bx), texH - s * (pad - dl.by))
+        val dl0 = DrawLayer(dl.kind, dl.footageId, dl.slot, dl.w, dl.h, m0, 1f, false, dl.lk, dl.color, dl.shape)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fxFbo[0])
+        GLES20.glViewport(0, 0, texW, texH)
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glClearColor(0f, 0f, 0f, 0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        drawLayer(stub, dl0)
+
+        // step 2: the effects, in order
+        var cur = 0
+        for (fx in dl.fx) cur = runEffect(fx, cur, texW, texH, workW, workH, pad, bw, bh)
+
+        // step 3: back to the composition
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glViewport(vx, vy, vw, vh)
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(vx, vy, vw, vh)
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        val m = dl.m.times(Affine.translate(dl.bx - pad, dl.by - pad))
+        drawTexQuad(sc, fxTex[cur], workW.toFloat(), workH.toFloat(), m, dl.opacity)
+    }
+
     // ---------- motion path drawing (surface pixels) ----------
 
     // draws the first n floats of ovArr (x, y pairs in surface pixels) in one colour
@@ -1016,7 +1285,9 @@ class CompGLView(context: Context) : GLSurfaceView(context), GLSurfaceView.Rende
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-        for (dl in sc.layers) drawLayer(sc, dl)
+        for (dl in sc.layers) {
+            if (dl.fx.isNotEmpty()) drawWithEffects(sc, dl, vx, vy, vw, vh) else drawLayer(sc, dl)
+        }
         GLES20.glLineWidth(2f * density)
         for (dl in sc.layers) {
             if (dl.lk == LayerKind.SHAPE) continue

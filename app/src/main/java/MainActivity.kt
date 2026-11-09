@@ -136,6 +136,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        EffectRegistry.load(this) // the effects in app/src/main/assets/effects
         session = Session(File(filesDir, "project.motion.json"))
         session.load()
         exporter = Exporter(this)
@@ -158,6 +159,7 @@ class MainActivity : Activity() {
             onSketchStart = { x, y -> sketchStart(x, y) }
             onSketchPoint = { x, y -> sketchPoint(x, y) }
             onSketchEnd = { sketchEnd() }
+            onFxError = { msg -> showFxError(msg) }
         }
         timeLabel = TextView(this).apply {
             setTextColor(Color.parseColor("#4DA3FF"))
@@ -185,6 +187,7 @@ class MainActivity : Activity() {
             onReset = { path -> resetValue(path) }
             onToggle = { path -> toggleAnim(path) }
             onKey = { path -> keyAction(path) }
+            onEffectTap = { id -> showEffectMenu(id) }
         }
 
         val row1 = LinearLayout(this).apply {
@@ -393,6 +396,7 @@ class MainActivity : Activity() {
             return
         }
         stopPlay()
+        if (c.layers.any { l -> l.effects.any { it.enabled } }) toast("Effects are not in the exported video yet")
         exporter.start(session.project, c) { msg, ok ->
             if (ok) {
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
@@ -803,7 +807,7 @@ class MainActivity : Activity() {
             ?: when (path) {
                 Path.POSITION_X -> defaults[Path.POSITION]?.value?.take(1)
                 Path.POSITION_Y -> defaults[Path.POSITION]?.value?.drop(1)?.take(1)
-                else -> null
+                else -> fxDefaultFor(l, path)
             }
             ?: return
         val lt = layerTimeNow(c, l)
@@ -1391,7 +1395,7 @@ class MainActivity : Activity() {
             "New Shape Layer: Rectangle", "New Shape Layer: Ellipse",
             "Duplicate Layer", "Rename Layer…", "Parent…", "Edit Colors…",
             if (multiMode) "Multi-select: ON (tap to turn off)" else "Multi-select: off (tap to turn on)",
-            "Sequence Layers…"
+            "Sequence Layers…", "Add Effect…"
         )
         AlertDialog.Builder(this)
             .setTitle("Layer")
@@ -1407,7 +1411,8 @@ class MainActivity : Activity() {
                     7 -> showParentDialog()
                     8 -> showColorsDialog()
                     9 -> toggleMulti()
-                    else -> showSequenceDialog()
+                    10 -> showSequenceDialog()
+                    else -> showAddEffectDialog()
                 }
             }
             .show()
@@ -1629,6 +1634,62 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // ---------- effects ----------
+
+    // Layer > Add Effect: the effects found in app/src/main/assets/effects
+    private fun showAddEffectDialog() {
+        val sel = selectedPair()
+        if (sel == null) {
+            toast("Tap a layer bar first")
+            return
+        }
+        val defs = EffectRegistry.all()
+        if (defs.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("No effects found")
+                .setMessage("Put the effect .json and .frag files in app/src/main/assets/effects\n\n" + EffectRegistry.errors.joinToString("\n"))
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Add Effect")
+            .setItems(defs.map { it.name }.toTypedArray()) { _, which ->
+                session.edit { p -> p.withEffectAdded(sel.first.id, sel.second.id, defs[which].id) }
+                refresh()
+            }
+            .show()
+    }
+
+    // tapping the title row of an effect in the panel: switch it off or on, or delete it
+    private fun showEffectMenu(effectId: Long) {
+        val sel = selectedPair() ?: return
+        val e = sel.second.effects.firstOrNull { it.id == effectId } ?: return
+        val items = arrayOf(if (e.enabled) "Turn off" else "Turn on", "Delete")
+        AlertDialog.Builder(this)
+            .setTitle(EffectRegistry.get(e.type)?.name ?: e.type)
+            .setItems(items) { _, which ->
+                session.edit { p ->
+                    if (which == 0) {
+                        p.withEffectEnabled(sel.first.id, sel.second.id, effectId, !e.enabled)
+                    } else {
+                        p.withEffectRemoved(sel.first.id, sel.second.id, effectId)
+                    }
+                }
+                refresh()
+            }
+            .show()
+    }
+
+    // an effect's shader did not compile (the message says which file and what is wrong)
+    private fun showFxError(msg: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Effect problem")
+            .setMessage(msg)
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
     private fun showInfo() {
         AlertDialog.Builder(this)
             .setTitle("Project info")
@@ -1638,7 +1699,7 @@ class MainActivity : Activity() {
     }
 
     private fun showSelfTest() {
-        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run() + KeyframeTest.run() + GraphTest.run() + LayersTest.run()
+        val lines = SelfTest.run() + GeometryTest.run() + OpsTest.run() + KeyframeTest.run() + GraphTest.run() + LayersTest.run() + EffectsTest.run()
         AlertDialog.Builder(this)
             .setTitle("Self-test")
             .setMessage(lines.joinToString("\n"))
