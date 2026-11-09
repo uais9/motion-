@@ -1,0 +1,28 @@
+{
+  "id": "motion_tile",
+  "name": "Motion Tile",
+  "params": [
+    { "key": "center", "label": "Tile Center", "dims": 2, "default": ["layerW / 2", "layerH / 2"], "step": 4 },
+    { "key": "tileW", "label": "Tile Width", "dims": 1, "default": [100], "min": 0, "step": 0.5 },
+    { "key": "tileH", "label": "Tile Height", "dims": 1, "default": [100], "min": 0, "step": 0.5 },
+    { "key": "outW", "label": "Output Width", "dims": 1, "default": [100], "min": 0, "step": 0.5 },
+    { "key": "outH", "label": "Output Height", "dims": 1, "default": [100], "min": 0, "step": 0.5 },
+    { "key": "mirror", "label": "Mirror Edges", "dims": 1, "default": [0], "min": 0, "max": 1, "step": 0.05 },
+    { "key": "phase", "label": "Phase", "dims": 1, "default": [0], "step": 0.8 },
+    { "key": "hphase", "label": "H Phase Shift", "dims": 1, "default": [0], "min": 0, "max": 1, "step": 0.05 }
+  ],
+  "pad": "max(0, (outW / 100 - 1) * layerW / 2, (outH / 100 - 1) * layerH / 2)",
+  "passes": [
+    {
+      "shader": "motion_tile.frag",
+      "uniforms": {
+        "uCenter": ["center[0]", "center[1]"],
+        "uTile": ["max(1, layerW * tileW / 100)", "max(1, layerH * tileH / 100)"],
+        "uOut": ["layerW * outW / 100", "layerH * outH / 100"],
+        "uMirror": ["mirror"],
+        "uPhase": ["phase"],
+        "uHPhase": ["hphase"]
+      }
+    }
+  ]
+}
